@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -91,12 +92,12 @@ pub fn download_from_chat(
 
     let tdl_path = resolve_tdl_path(&app, &state)?;
     let export_path = temp_chat_json(&state, "selected")?;
-    let ids = request
-        .message_ids
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
+    let mut selected_ids = request.message_ids.clone();
+    selected_ids.sort_unstable();
+    selected_ids.dedup();
+    let selected_set: HashSet<i64> = selected_ids.iter().copied().collect();
+    let first_id = selected_ids[0];
+    let last_id = selected_ids[selected_ids.len() - 1];
     let export_args = vec![
         "chat".to_string(),
         "export".to_string(),
@@ -107,11 +108,12 @@ pub fn download_from_chat(
         "-c".to_string(),
         request.chat_id.clone(),
         "-i".to_string(),
-        ids,
+        format!("{first_id},{last_id}"),
         "-o".to_string(),
         export_path.to_string_lossy().to_string(),
     ];
     run_tdl_with_timeout(&tdl_path, &export_args, CHAT_EXPORT_TIMEOUT)?;
+    filter_exported_messages(&export_path, &selected_set)?;
 
     let download_args = build_chat_download_args(&request, &export_path);
     let mut command = Command::new(&tdl_path);
@@ -132,7 +134,7 @@ pub fn download_from_chat(
     let records = vec![DownloadRecord {
         id: state.next_id("record"),
         task_id: task_id.clone(),
-        source: format!("{} · {} 条消息", request.chat_name, request.message_ids.len()),
+        source: format!("{} · {} 条消息", request.chat_name, selected_ids.len()),
         mode: SourceMode::Chat,
         directory: directory.to_string(),
         status: DownloadStatus::Downloading,
@@ -282,6 +284,44 @@ fn parse_messages_file(path: &Path) -> Result<Vec<MessageInfo>, String> {
     Ok(messages.iter().filter_map(parse_message_info).collect())
 }
 
+fn filter_exported_messages(path: &Path, selected_ids: &HashSet<i64>) -> Result<(), String> {
+    let content = fs::read_to_string(path).map_err(|error| format!("读取已导出的消息失败: {error}"))?;
+    let mut value: Value = serde_json::from_str(&content).map_err(|error| format!("解析已导出的消息失败: {error}"))?;
+    let kept = filter_messages_in_value(&mut value, selected_ids)?;
+    if kept == 0 {
+        return Err("tdl 已导出消息范围，但没有找到已勾选的消息。".into());
+    }
+    let content = serde_json::to_string_pretty(&value).map_err(|error| format!("序列化已筛选消息失败: {error}"))?;
+    fs::write(path, content).map_err(|error| format!("写入已筛选消息失败: {error}"))
+}
+
+fn filter_messages_in_value(value: &mut Value, selected_ids: &HashSet<i64>) -> Result<usize, String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(messages)) = map.get_mut("messages") {
+                messages.retain(|message| message_id(message).is_some_and(|id| selected_ids.contains(&id)));
+                return Ok(messages.len());
+            }
+            for child in map.values_mut() {
+                let kept = filter_messages_in_value(child, selected_ids)?;
+                if kept > 0 {
+                    return Ok(kept);
+                }
+            }
+            Ok(0)
+        }
+        Value::Array(items) => {
+            items.retain(|message| message_id(message).is_some_and(|id| selected_ids.contains(&id)));
+            Ok(items.len())
+        }
+        _ => Err("tdl 导出结果里没有可筛选的 messages 数组。".into()),
+    }
+}
+
+fn message_id(value: &Value) -> Option<i64> {
+    get_i64(value, &["id", "ID", "message_id", "messageId", "MessageID", "MessageId"])
+}
+
 fn find_messages(value: &Value) -> Option<&Vec<Value>> {
     match value {
         Value::Object(map) => {
@@ -296,7 +336,7 @@ fn find_messages(value: &Value) -> Option<&Vec<Value>> {
 }
 
 fn parse_message_info(value: &Value) -> Option<MessageInfo> {
-    let id = get_i64(value, &["id", "ID", "message_id", "messageId"])?;
+    let id = message_id(value)?;
     Some(MessageInfo {
         id,
         date: get_string(value, &["date", "Date", "created_at", "createdAt"]),

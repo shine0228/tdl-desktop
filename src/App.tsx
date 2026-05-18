@@ -643,7 +643,7 @@ function App() {
             request: {
               chatId: String(selectedChat!.id),
               chatName: selectedChat!.name,
-              messageIds: Array.from(selectedMessageIds),
+              messageIds: Array.from(selectedMessageIds).sort((a, b) => a - b),
               directory,
               limit: config.limit,
               threads: config.threads,
