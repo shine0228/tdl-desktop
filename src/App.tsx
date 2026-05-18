@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertCircle,
+  Bot,
   CheckCircle2,
   ChevronDown,
   Download,
@@ -27,12 +28,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AppConfig,
   AppState,
+  ChatDownloadRequest,
+  ChatInfo,
   DownloadEvent,
   DownloadFileProgress,
   DownloadRecord,
   DownloadRequest,
   DownloadStarted,
   DownloadStatus,
+  MessageInfo,
   LoginEvent,
   LoginMethod,
   LoginStarted,
@@ -61,6 +65,7 @@ const modeLabel: Record<SourceMode, string> = {
   links: "链接",
   json: "JSON",
   raw: "原始参数",
+  chat: "对话",
 };
 
 type PreviewState =
@@ -92,6 +97,18 @@ function formatDate(value?: string | null) {
   });
 }
 
+function formatFileSize(value?: number | null) {
+  if (!value || value <= 0) return "未知大小";
+  const units = ["B", "KB", "MB", "GB"];
+  let size = value;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${size >= 10 || unit === 0 ? Math.round(size) : size.toFixed(1)} ${units[unit]}`;
+}
+
 function tdlSourceLabel(info: TdlInfo | null) {
   if (!info || !info.available) return "tdl 不可用";
   const source =
@@ -104,6 +121,10 @@ function tdlSourceLabel(info: TdlInfo | null) {
 }
 
 function buildLocalPreview(request: DownloadRequest) {
+  if (request.mode === "chat") {
+    return "tdl chat export ... && tdl download -f <selected-messages.json>";
+  }
+
   if (request.mode === "raw") {
     return `tdl ${request.rawArgs.trim()}`;
   }
@@ -191,6 +212,14 @@ function App() {
   const [loginLogs, setLoginLogs] = useState<string[]>([]);
   const [desktopPath, setDesktopPath] = useState("");
   const [desktopPasscode, setDesktopPasscode] = useState("");
+  const [chats, setChats] = useState<ChatInfo[]>([]);
+  const [chatSearch, setChatSearch] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [selectedChat, setSelectedChat] = useState<ChatInfo | null>(null);
+  const [messages, setMessages] = useState<MessageInfo[]>([]);
+  const [messagesLoading, setMessagesLoading] = useState(false);
+  const [selectedMessageIds, setSelectedMessageIds] = useState<Set<number>>(new Set());
+  const [messageCount, setMessageCount] = useState(50);
   const [message, setMessage] = useState("正在加载");
   const [busy, setBusy] = useState(false);
 
@@ -382,6 +411,17 @@ function App() {
 
   const commandPreview = useMemo(() => buildLocalPreview(request), [request]);
 
+  const filteredChats = useMemo(() => {
+    const keyword = chatSearch.trim().toLowerCase();
+    if (!keyword) return chats;
+    return chats.filter((chat) =>
+      [chat.name, chat.username ?? "", chat.chatType, String(chat.id)]
+        .join(" ")
+        .toLowerCase()
+        .includes(keyword),
+    );
+  }, [chatSearch, chats]);
+
   async function loadState() {
     if (!inTauri()) {
       setMessage("前端预览模式");
@@ -525,10 +565,69 @@ function App() {
     }
   }
 
+  async function loadChats() {
+    if (!inTauri()) return;
+    setChatLoading(true);
+    setMessage("正在读取对话列表");
+    try {
+      const items = await invoke<ChatInfo[]>("list_chats");
+      setChats(items);
+      setMessage(`已加载 ${items.length} 个对话`);
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setChatLoading(false);
+    }
+  }
+
+  async function loadMessages(chat: ChatInfo) {
+    if (!inTauri()) return;
+    setSelectedChat(chat);
+    setMessages([]);
+    setSelectedMessageIds(new Set());
+    setMessagesLoading(true);
+    setMessage(`正在读取 ${chat.name} 的最近 ${messageCount} 条消息`);
+    try {
+      const items = await invoke<MessageInfo[]>("export_chat_messages", {
+        chatId: String(chat.id),
+        count: messageCount,
+      });
+      setMessages(items);
+      setMessage(`已读取 ${items.length} 条消息`);
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setMessagesLoading(false);
+    }
+  }
+
+  function toggleMessage(id: number) {
+    setSelectedMessageIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }
+
+  function toggleAllMessages() {
+    setSelectedMessageIds((current) => {
+      if (current.size === messages.length) return new Set();
+      return new Set(messages.map((item) => item.id));
+    });
+  }
+
   async function startDownload() {
     if (runningTaskId) return;
     if (!directory.trim() && mode !== "raw") {
       setMessage("请选择下载目录");
+      return;
+    }
+    if (mode === "chat" && (!selectedChat || selectedMessageIds.size === 0)) {
+      setMessage("请选择对话和至少一条消息");
       return;
     }
 
@@ -539,7 +638,29 @@ function App() {
     setMessage("启动下载");
 
     try {
-      const started = await invoke<DownloadStarted>("start_download", { request });
+      const started = mode === "chat"
+        ? await invoke<DownloadStarted>("download_from_chat", {
+            request: {
+              chatId: String(selectedChat!.id),
+              chatName: selectedChat!.name,
+              messageIds: Array.from(selectedMessageIds),
+              directory,
+              limit: config.limit,
+              threads: config.threads,
+              pool: config.pool,
+              group,
+              include,
+              exclude,
+              template,
+              skipSame,
+              continueLast,
+              restart,
+              desc,
+              takeout,
+              rewriteExt,
+            } satisfies ChatDownloadRequest,
+          })
+        : await invoke<DownloadStarted>("start_download", { request });
       setRunningTaskId(started.taskId);
       setHistory((current) => [...started.records, ...current]);
       setLogs([started.commandPreview]);
@@ -686,6 +807,10 @@ function App() {
                 <Terminal size={16} />
                 原始
               </button>
+              <button className={mode === "chat" ? "active" : ""} onClick={() => setMode("chat")}>
+                <Bot size={16} />
+                对话
+              </button>
             </div>
 
             {mode === "links" ? (
@@ -725,6 +850,25 @@ function App() {
                   placeholder="download -u https://t.me/tdl/1 --group"
                 />
               </label>
+            ) : null}
+
+            {mode === "chat" ? (
+              <ChatBrowser
+                chats={filteredChats}
+                selectedChat={selectedChat}
+                messages={messages}
+                selectedMessageIds={selectedMessageIds}
+                chatSearch={chatSearch}
+                messageCount={messageCount}
+                loadingChats={chatLoading}
+                loadingMessages={messagesLoading}
+                onSearchChange={setChatSearch}
+                onMessageCountChange={setMessageCount}
+                onLoadChats={() => void loadChats()}
+                onSelectChat={(chat) => void loadMessages(chat)}
+                onToggleMessage={toggleMessage}
+                onToggleAll={toggleAllMessages}
+              />
             ) : null}
 
             {mode !== "raw" ? (
@@ -1052,6 +1196,123 @@ function LoginPanel({
           ))}
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function ChatBrowser({
+  chats,
+  selectedChat,
+  messages,
+  selectedMessageIds,
+  chatSearch,
+  messageCount,
+  loadingChats,
+  loadingMessages,
+  onSearchChange,
+  onMessageCountChange,
+  onLoadChats,
+  onSelectChat,
+  onToggleMessage,
+  onToggleAll,
+}: {
+  chats: ChatInfo[];
+  selectedChat: ChatInfo | null;
+  messages: MessageInfo[];
+  selectedMessageIds: Set<number>;
+  chatSearch: string;
+  messageCount: number;
+  loadingChats: boolean;
+  loadingMessages: boolean;
+  onSearchChange: (value: string) => void;
+  onMessageCountChange: (value: number) => void;
+  onLoadChats: () => void;
+  onSelectChat: (chat: ChatInfo) => void;
+  onToggleMessage: (id: number) => void;
+  onToggleAll: () => void;
+}) {
+  return (
+    <div className="chat-browser">
+      <div className="chat-toolbar">
+        <label className="field compact">
+          <span>搜索对话</span>
+          <input
+            value={chatSearch}
+            onChange={(event) => onSearchChange(event.target.value)}
+            placeholder="名称、用户名、ID"
+          />
+        </label>
+        <label className="field compact count-field">
+          <span>最近消息</span>
+          <input
+            type="number"
+            min={1}
+            max={500}
+            value={messageCount}
+            onChange={(event) => onMessageCountChange(Number(event.target.value))}
+          />
+        </label>
+        <button className="ghost-button" onClick={onLoadChats} disabled={loadingChats}>
+          {loadingChats ? <LoaderCircle size={16} /> : <RefreshCcw size={16} />}
+          加载对话
+        </button>
+      </div>
+
+      <div className="chat-grid">
+        <div className="chat-list">
+          {chats.length ? (
+            chats.map((chat) => (
+              <button
+                className={`chat-item ${selectedChat?.id === chat.id ? "active" : ""}`}
+                key={chat.id}
+                onClick={() => onSelectChat(chat)}
+                disabled={loadingMessages}
+              >
+                <strong>{chat.name}</strong>
+                <span>{chat.chatType || "chat"} · {chat.username ? `@${chat.username}` : chat.id}</span>
+              </button>
+            ))
+          ) : (
+            <div className="chat-empty">点击“加载对话”读取 Telegram 对话列表</div>
+          )}
+        </div>
+
+        <div className="message-list">
+          <div className="message-list-header">
+            <strong>{selectedChat ? selectedChat.name : "消息"}</strong>
+            <button className="text-button" onClick={onToggleAll} disabled={!messages.length || loadingMessages}>
+              {selectedMessageIds.size === messages.length && messages.length ? "取消全选" : "全选"}
+            </button>
+          </div>
+          {loadingMessages ? (
+            <div className="chat-empty"><LoaderCircle size={16} /> 正在读取消息...</div>
+          ) : messages.length ? (
+            messages.map((item) => (
+              <label className="message-item" key={item.id}>
+                <input
+                  type="checkbox"
+                  checked={selectedMessageIds.has(item.id)}
+                  onChange={() => onToggleMessage(item.id)}
+                />
+                <div>
+                  <div className="message-top">
+                    <strong>#{item.id}</strong>
+                    <span>{formatDate(item.date)}</span>
+                  </div>
+                  <p>{item.text || item.fileName || item.mediaType || "无文字内容"}</p>
+                  <div className="message-meta">
+                    {item.fileName ? <span>{item.fileName}</span> : null}
+                    {item.fileSize ? <span>{formatFileSize(item.fileSize)}</span> : null}
+                    {item.mediaType ? <span>{item.mediaType}</span> : null}
+                  </div>
+                </div>
+              </label>
+            ))
+          ) : (
+            <div className="chat-empty">选择一个对话后读取最近消息</div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

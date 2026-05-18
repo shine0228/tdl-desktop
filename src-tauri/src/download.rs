@@ -1,5 +1,7 @@
 use std::{
+    fs,
     io::{BufRead, BufReader, Read},
+    path::PathBuf,
     process::Child,
     sync::{Arc, Mutex},
     thread,
@@ -43,6 +45,7 @@ pub fn build_records(
             }
             vec![request.raw_args.trim().to_string()]
         }
+        SourceMode::Chat => return Err("对话模式请使用对话下载命令。".into()),
     };
 
     Ok(sources
@@ -114,6 +117,7 @@ pub fn build_download_args(request: &DownloadRequest) -> Result<Vec<String>, Str
             }
         }
         SourceMode::Raw => unreachable!(),
+        SourceMode::Chat => return Err("对话模式请使用对话下载命令。".into()),
     }
 
     if request.group {
@@ -265,6 +269,17 @@ pub fn spawn_process_monitor(
     record_ids: Vec<String>,
     child: Arc<Mutex<Child>>,
 ) {
+    spawn_process_monitor_with_cleanup(app, state, task_id, record_ids, child, None);
+}
+
+pub fn spawn_process_monitor_with_cleanup(
+    app: AppHandle,
+    state: StateRefs,
+    task_id: String,
+    record_ids: Vec<String>,
+    child: Arc<Mutex<Child>>,
+    cleanup_file: Option<PathBuf>,
+) {
     thread::spawn(move || {
         let exit_code = loop {
             let status = {
@@ -290,6 +305,9 @@ pub fn spawn_process_monitor(
 
         if let Ok(mut running) = state.running.lock() {
             running.remove(&task_id);
+        }
+        if let Some(path) = cleanup_file {
+            let _ = fs::remove_file(path);
         }
 
         let (status, message, error) = if cancelled {

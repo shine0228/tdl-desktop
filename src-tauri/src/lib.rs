@@ -1,3 +1,4 @@
+mod chat;
 mod commands;
 mod download;
 mod login;
@@ -23,6 +24,9 @@ pub fn run() {
             commands::clear_history,
             commands::refresh_tdl_info,
             commands::update_tdl,
+            chat::list_chats,
+            chat::export_chat_messages,
+            chat::download_from_chat,
             login::check_login_status,
             login::start_login,
             login::cancel_login,

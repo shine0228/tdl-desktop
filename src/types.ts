@@ -1,4 +1,4 @@
-export type SourceMode = "links" | "json" | "raw";
+export type SourceMode = "links" | "json" | "raw" | "chat";
 
 export type DownloadStatus =
   | "downloading"
@@ -66,6 +66,42 @@ export interface DownloadRequest {
   desc: boolean;
   takeout: boolean;
   rewriteExt: boolean;
+}
+
+export interface ChatDownloadRequest {
+  chatId: string;
+  chatName: string;
+  messageIds: number[];
+  directory: string;
+  limit: number;
+  threads: number;
+  pool: number;
+  group: boolean;
+  include: string;
+  exclude: string;
+  template: string;
+  skipSame: boolean;
+  continueLast: boolean;
+  restart: boolean;
+  desc: boolean;
+  takeout: boolean;
+  rewriteExt: boolean;
+}
+
+export interface ChatInfo {
+  id: number;
+  name: string;
+  chatType: string;
+  username?: string | null;
+}
+
+export interface MessageInfo {
+  id: number;
+  date?: string | null;
+  text?: string | null;
+  mediaType?: string | null;
+  fileName?: string | null;
+  fileSize?: number | null;
 }
 
 export interface DownloadStarted {

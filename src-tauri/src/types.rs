@@ -59,12 +59,35 @@ pub struct DownloadRequest {
     pub rewrite_ext: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatDownloadRequest {
+    pub chat_id: String,
+    pub chat_name: String,
+    pub message_ids: Vec<i64>,
+    pub directory: String,
+    pub limit: u8,
+    pub threads: u8,
+    pub pool: u8,
+    pub group: bool,
+    pub include: String,
+    pub exclude: String,
+    pub template: String,
+    pub skip_same: bool,
+    pub continue_last: bool,
+    pub restart: bool,
+    pub desc: bool,
+    pub takeout: bool,
+    pub rewrite_ext: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SourceMode {
     Links,
     Json,
     Raw,
+    Chat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +160,26 @@ pub struct LinkPreview {
     pub message_id: u64,
     pub text: Option<String>,
     pub media_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatInfo {
+    pub id: i64,
+    pub name: String,
+    pub chat_type: String,
+    pub username: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageInfo {
+    pub id: i64,
+    pub date: Option<String>,
+    pub text: Option<String>,
+    pub media_type: Option<String>,
+    pub file_name: Option<String>,
+    pub file_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
