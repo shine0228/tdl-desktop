@@ -24,7 +24,7 @@ use crate::{
 const LOGIN_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[tauri::command]
-pub fn check_login_status(
+pub async fn check_login_status(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<LoginStatus, String> {
@@ -43,6 +43,13 @@ pub fn check_login_status(
         tdl.path
             .ok_or_else(|| "tdl 路径不可用，无法检查登录状态。".to_string())?,
     );
+
+    tauri::async_runtime::spawn_blocking(move || check_login_status_with_tdl(tdl_path))
+        .await
+        .map_err(|error| format!("检查 Telegram 登录状态失败: {error}"))?
+}
+
+fn check_login_status_with_tdl(tdl_path: PathBuf) -> Result<LoginStatus, String> {
     let mut command = Command::new(&tdl_path);
     apply_hidden_process_flags(&mut command);
     command

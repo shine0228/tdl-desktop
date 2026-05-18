@@ -4,6 +4,7 @@ import {
   AlertCircle,
   Bot,
   CheckCircle2,
+  CheckSquare2,
   ChevronDown,
   Download,
   FileJson,
@@ -14,6 +15,7 @@ import {
   LoaderCircle,
   MessageSquareText,
   Play,
+  Search,
   QrCode,
   RefreshCcw,
   RotateCw,
@@ -777,7 +779,7 @@ function App() {
         : "-";
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${mode === "chat" ? "chat-shell" : ""}`}>
       <section className="workbench">
         <header className="topbar">
           <div>
@@ -800,6 +802,56 @@ function App() {
           </div>
         </header>
 
+        <div className="mode-switcher">
+          <div className="segmented">
+            <button className={mode === "links" ? "active" : ""} onClick={() => setMode("links")}>
+              <LinkIcon size={16} />
+              链接
+            </button>
+            <button className={mode === "json" ? "active" : ""} onClick={() => setMode("json")}>
+              <FileJson size={16} />
+              JSON
+            </button>
+            <button className={mode === "raw" ? "active" : ""} onClick={() => setMode("raw")}>
+              <Terminal size={16} />
+              原始
+            </button>
+            <button className={mode === "chat" ? "active" : ""} onClick={() => setMode("chat")}>
+              <Bot size={16} />
+              对话
+            </button>
+          </div>
+        </div>
+
+        {mode === "chat" ? (
+          <TelegramWorkspace
+            chats={filteredChats}
+            selectedChat={selectedChat}
+            messages={messages}
+            selectedMessageIds={selectedMessageIds}
+            chatSearch={chatSearch}
+            messageCount={messageCount}
+            loadingChats={chatLoading}
+            loadingMessages={messagesLoading}
+            directory={directory}
+            running={running}
+            busy={busy}
+            progressSummary={progressSummary}
+            latestLog={latestLog}
+            loginStatus={loginStatus}
+            onSearchChange={setChatSearch}
+            onMessageCountChange={setMessageCount}
+            onLoadChats={() => void loadChats()}
+            onSelectChat={(chat) => void loadMessages(chat)}
+            onRefreshMessages={() => selectedChat && void loadMessages(selectedChat)}
+            onToggleMessage={toggleMessage}
+            onToggleAll={toggleAllMessages}
+            onPickDirectory={() => void pickDirectory()}
+            onDirectoryChange={setDirectory}
+            onStartDownload={() => void startDownload()}
+            onCancelDownload={() => void cancelDownload()}
+          />
+        ) : (
         <div className="content-grid">
           <section className="task-panel">
             <div className="section-header">
@@ -807,24 +859,6 @@ function App() {
               <span>{message}</span>
             </div>
 
-            <div className="segmented">
-              <button className={mode === "links" ? "active" : ""} onClick={() => setMode("links")}>
-                <LinkIcon size={16} />
-                链接
-              </button>
-              <button className={mode === "json" ? "active" : ""} onClick={() => setMode("json")}>
-                <FileJson size={16} />
-                JSON
-              </button>
-              <button className={mode === "raw" ? "active" : ""} onClick={() => setMode("raw")}>
-                <Terminal size={16} />
-                原始
-              </button>
-              <button className={mode === "chat" ? "active" : ""} onClick={() => setMode("chat")}>
-                <Bot size={16} />
-                对话
-              </button>
-            </div>
 
             {mode === "links" ? (
               <>
@@ -865,24 +899,6 @@ function App() {
               </label>
             ) : null}
 
-            {mode === "chat" ? (
-              <ChatBrowser
-                chats={filteredChats}
-                selectedChat={selectedChat}
-                messages={messages}
-                selectedMessageIds={selectedMessageIds}
-                chatSearch={chatSearch}
-                messageCount={messageCount}
-                loadingChats={chatLoading}
-                loadingMessages={messagesLoading}
-                onSearchChange={setChatSearch}
-                onMessageCountChange={setMessageCount}
-                onLoadChats={() => void loadChats()}
-                onSelectChat={(chat) => void loadMessages(chat)}
-                onToggleMessage={toggleMessage}
-                onToggleAll={toggleAllMessages}
-              />
-            ) : null}
 
             {mode !== "raw" ? (
               <div className="directory-row">
@@ -1040,28 +1056,31 @@ function App() {
             </div>
           </section>
         </div>
+        )}
       </section>
 
-      <section className="history-section">
-        <div className="section-header">
-          <h2>任务历史</h2>
-          <button className="ghost-button" onClick={clearHistory}>
-            <Trash2 size={16} />
-            清空
-          </button>
-        </div>
+      {mode !== "chat" ? (
+        <section className="history-section">
+          <div className="section-header">
+            <h2>任务历史</h2>
+            <button className="ghost-button" onClick={clearHistory}>
+              <Trash2 size={16} />
+              清空
+            </button>
+          </div>
 
-        <div className="history-list">
-          {history.length ? (
-            history.map((record) => <HistoryItem key={record.id} record={record} />)
-          ) : (
-            <div className="empty-state">
-              <ListChecks size={20} />
-              <span>暂无记录</span>
-            </div>
-          )}
-        </div>
-      </section>
+          <div className="history-list">
+            {history.length ? (
+              history.map((record) => <HistoryItem key={record.id} record={record} />)
+            ) : (
+              <div className="empty-state">
+                <ListChecks size={20} />
+                <span>暂无记录</span>
+              </div>
+            )}
+          </div>
+        </section>
+      ) : null}
     </main>
   );
 }
@@ -1227,7 +1246,7 @@ function LoginPanel({
   );
 }
 
-function ChatBrowser({
+function TelegramWorkspace({
   chats,
   selectedChat,
   messages,
@@ -1236,12 +1255,23 @@ function ChatBrowser({
   messageCount,
   loadingChats,
   loadingMessages,
+  directory,
+  running,
+  busy,
+  progressSummary,
+  latestLog,
+  loginStatus,
   onSearchChange,
   onMessageCountChange,
   onLoadChats,
   onSelectChat,
+  onRefreshMessages,
   onToggleMessage,
   onToggleAll,
+  onPickDirectory,
+  onDirectoryChange,
+  onStartDownload,
+  onCancelDownload,
 }: {
   chats: ChatInfo[];
   selectedChat: ChatInfo | null;
@@ -1251,96 +1281,187 @@ function ChatBrowser({
   messageCount: number;
   loadingChats: boolean;
   loadingMessages: boolean;
+  directory: string;
+  running: boolean;
+  busy: boolean;
+  progressSummary: string;
+  latestLog: string;
+  loginStatus: LoginStatus;
   onSearchChange: (value: string) => void;
   onMessageCountChange: (value: number) => void;
   onLoadChats: () => void;
   onSelectChat: (chat: ChatInfo) => void;
+  onRefreshMessages: () => void;
   onToggleMessage: (id: number) => void;
   onToggleAll: () => void;
+  onPickDirectory: () => void;
+  onDirectoryChange: (value: string) => void;
+  onStartDownload: () => void;
+  onCancelDownload: () => void;
 }) {
+  const selectedCount = selectedMessageIds.size;
+  const allSelected = messages.length > 0 && selectedCount === messages.length;
+
   return (
-    <div className="chat-browser">
-      <div className="chat-toolbar">
-        <label className="field compact">
-          <span>搜索对话</span>
+    <div className="telegram-workspace">
+      <aside className="telegram-sidebar">
+        <div className="telegram-sidebar-head">
+          <div>
+            <strong>对话</strong>
+            <span>{loginStatus.loggedIn ? loggedInLabel(loginStatus) : "请先登录 Telegram"}</span>
+          </div>
+          <button className="icon-button compact-icon" onClick={onLoadChats} disabled={loadingChats} title="刷新对话">
+            {loadingChats ? <LoaderCircle size={17} /> : <RefreshCcw size={17} />}
+          </button>
+        </div>
+        <div className="telegram-search">
+          <Search size={16} />
           <input
             value={chatSearch}
             onChange={(event) => onSearchChange(event.target.value)}
-            placeholder="名称、用户名、ID"
+            placeholder="搜索对话、用户名或 ID"
           />
-        </label>
-        <label className="field compact count-field">
-          <span>最近消息</span>
-          <input
-            type="number"
-            min={1}
-            max={500}
-            value={messageCount}
-            onChange={(event) => onMessageCountChange(Number(event.target.value))}
-          />
-        </label>
-        <button className="ghost-button" onClick={onLoadChats} disabled={loadingChats}>
-          {loadingChats ? <LoaderCircle size={16} /> : <RefreshCcw size={16} />}
-          加载对话
-        </button>
-      </div>
-
-      <div className="chat-grid">
-        <div className="chat-list">
+        </div>
+        <div className="telegram-chat-list">
           {chats.length ? (
             chats.map((chat) => (
               <button
-                className={`chat-item ${selectedChat?.id === chat.id ? "active" : ""}`}
+                className={`telegram-chat-item ${selectedChat?.id === chat.id ? "active" : ""}`}
                 key={chat.id}
                 onClick={() => onSelectChat(chat)}
                 disabled={loadingMessages}
               >
-                <strong>{chat.name}</strong>
-                <span>{chat.chatType || "chat"} · {chat.username ? `@${chat.username}` : chat.id}</span>
+                <div className="chat-avatar">{chat.name.trim().slice(0, 1).toUpperCase() || "T"}</div>
+                <div className="telegram-chat-main">
+                  <strong>{chat.name}</strong>
+                  <span>{chat.chatType || "chat"} · {chat.username ? `@${chat.username}` : chat.id}</span>
+                </div>
               </button>
             ))
           ) : (
-            <div className="chat-empty">点击“加载对话”读取 Telegram 对话列表</div>
+            <div className="telegram-empty">点击右上角刷新读取对话列表</div>
           )}
         </div>
+      </aside>
 
-        <div className="message-list">
-          <div className="message-list-header">
-            <strong>{selectedChat ? selectedChat.name : "消息"}</strong>
-            <button className="text-button" onClick={onToggleAll} disabled={!messages.length || loadingMessages}>
-              {selectedMessageIds.size === messages.length && messages.length ? "取消全选" : "全选"}
+      <section className="telegram-main">
+        <header className="telegram-header">
+          <div className="telegram-title">
+            <div className="chat-avatar large">{selectedChat?.name.trim().slice(0, 1).toUpperCase() || "T"}</div>
+            <div>
+              <strong>{selectedChat?.name ?? "选择一个对话"}</strong>
+              <span>
+                {selectedChat
+                  ? `${messages.length} 条已加载 · ${selectedChat.username ? `@${selectedChat.username}` : selectedChat.id}`
+                  : "只读浏览，选择消息后下载"}
+              </span>
+            </div>
+          </div>
+          <div className="telegram-actions">
+            <select
+              value={messageCount}
+              onChange={(event) => onMessageCountChange(Number(event.target.value))}
+              disabled={loadingMessages}
+              title="最近消息数量"
+            >
+              <option value={50}>最近 50</option>
+              <option value={100}>最近 100</option>
+              <option value={200}>最近 200</option>
+            </select>
+            <button className="ghost-button" onClick={onRefreshMessages} disabled={!selectedChat || loadingMessages}>
+              {loadingMessages ? <LoaderCircle size={16} /> : <RefreshCcw size={16} />}
+              刷新消息
+            </button>
+            <button className="ghost-button" onClick={onToggleAll} disabled={!messages.length || loadingMessages}>
+              <CheckSquare2 size={16} />
+              {allSelected ? "取消全选" : "全选"}
+            </button>
+            <button className="primary-button" onClick={onStartDownload} disabled={!selectedChat || selectedCount === 0 || busy || running}>
+              <Download size={17} />
+              {selectedCount ? `下载选中 ${selectedCount} 条` : "下载"}
+            </button>
+            <button className="danger-button" onClick={onCancelDownload} disabled={!running}>
+              <Square size={16} />
+              取消
             </button>
           </div>
-          {loadingMessages ? (
-            <div className="chat-empty"><LoaderCircle size={16} /> 正在读取消息...</div>
+        </header>
+
+        <div className="telegram-download-bar">
+          <label className="field compact">
+            <span>下载目录</span>
+            <input value={directory} onChange={(event) => onDirectoryChange(event.target.value)} />
+          </label>
+          <button className="icon-button compact-icon" onClick={onPickDirectory} title="选择目录">
+            <FolderOpen size={18} />
+          </button>
+          <div className="telegram-run-state">
+            <strong>{progressSummary}</strong>
+            <span>{latestLog}</span>
+          </div>
+        </div>
+
+        <div className="telegram-messages">
+          {!selectedChat ? (
+            <div className="telegram-hero">
+              <Bot size={42} />
+              <strong>选择一个对话开始浏览</strong>
+              <span>这里是只读模式，不会发送任何消息。</span>
+            </div>
+          ) : loadingMessages ? (
+            <div className="telegram-hero">
+              <LoaderCircle size={34} />
+              <strong>正在读取消息</strong>
+              <span>tdl 正在导出最近 {messageCount} 条消息。</span>
+            </div>
           ) : messages.length ? (
             messages.map((item) => (
-              <label className="message-item" key={item.id}>
-                <input
-                  type="checkbox"
-                  checked={selectedMessageIds.has(item.id)}
-                  onChange={() => onToggleMessage(item.id)}
-                />
-                <div>
-                  <div className="message-top">
-                    <strong>#{item.id}</strong>
-                    <span>{formatDate(item.date)}</span>
-                  </div>
-                  <p>{item.text || item.fileName || item.mediaType || "无文字内容"}</p>
-                  <div className="message-meta">
-                    {item.fileName ? <span>{item.fileName}</span> : null}
-                    {item.fileSize ? <span>{formatFileSize(item.fileSize)}</span> : null}
-                    {item.mediaType ? <span>{item.mediaType}</span> : null}
-                  </div>
-                </div>
-              </label>
+              <MessageBubble
+                key={item.id}
+                message={item}
+                selected={selectedMessageIds.has(item.id)}
+                onToggle={() => onToggleMessage(item.id)}
+              />
             ))
           ) : (
-            <div className="chat-empty">选择一个对话后读取最近消息</div>
+            <div className="telegram-hero">
+              <MessageSquareText size={38} />
+              <strong>没有可显示的消息</strong>
+              <span>可以刷新消息或增加最近消息数量。</span>
+            </div>
           )}
         </div>
-      </div>
+      </section>
     </div>
+  );
+}
+
+function MessageBubble({
+  message,
+  selected,
+  onToggle,
+}: {
+  message: MessageInfo;
+  selected: boolean;
+  onToggle: () => void;
+}) {
+  const title = message.fileName || message.mediaType || (message.fileSize ? "媒体消息" : "消息");
+  return (
+    <label className={`message-bubble ${selected ? "selected" : ""}`}>
+      <input type="checkbox" checked={selected} onChange={onToggle} />
+      <div className="message-bubble-body">
+        <div className="message-bubble-top">
+          <strong>{title}</strong>
+          <span>#{message.id}</span>
+        </div>
+        <p>{message.text || "无文字内容"}</p>
+        <div className="message-bubble-meta">
+          <span>{formatDate(message.date)}</span>
+          {message.fileSize ? <span>{formatFileSize(message.fileSize)}</span> : null}
+          {message.mediaType ? <span>{message.mediaType}</span> : null}
+        </div>
+      </div>
+    </label>
   );
 }
 

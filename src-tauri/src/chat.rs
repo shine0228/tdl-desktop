@@ -367,7 +367,16 @@ fn find_text(value: &Value) -> Option<String> {
 }
 
 fn find_media_type(value: &Value) -> Option<String> {
-    const KEYS: &[&str] = &["media", "mime_type", "mimeType", "type", "class_name", "className"];
+    const KEYS: &[&str] = &[
+        "media",
+        "mime_type",
+        "mimeType",
+        "mime",
+        "type",
+        "class_name",
+        "className",
+        "_",
+    ];
     match value {
         Value::Object(map) => {
             for key in KEYS {
@@ -385,7 +394,15 @@ fn find_media_type(value: &Value) -> Option<String> {
 }
 
 fn find_file_name(value: &Value) -> Option<String> {
-    const KEYS: &[&str] = &["file_name", "fileName", "filename", "name"];
+    const KEYS: &[&str] = &[
+        "file_name",
+        "fileName",
+        "filename",
+        "name",
+        "title",
+        "FileName",
+        "attributes",
+    ];
     match value {
         Value::Object(map) => {
             for key in KEYS {
@@ -403,7 +420,7 @@ fn find_file_name(value: &Value) -> Option<String> {
 }
 
 fn find_file_size(value: &Value) -> Option<i64> {
-    const KEYS: &[&str] = &["file_size", "fileSize", "size"];
+    const KEYS: &[&str] = &["file_size", "fileSize", "FileSize", "size", "Size", "bytes"];
     match value {
         Value::Object(map) => {
             for key in KEYS {
