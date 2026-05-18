@@ -1,0 +1,209 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppConfig {
+    pub last_directory: String,
+    pub limit: u8,
+    pub threads: u8,
+    pub pool: u8,
+    pub tdl_override_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSnapshot {
+    pub config: AppConfig,
+    pub history: Vec<DownloadRecord>,
+    pub tdl: TdlInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TdlInfo {
+    pub available: bool,
+    pub version: Option<String>,
+    pub path: Option<String>,
+    pub source: TdlSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TdlSource {
+    Bundled,
+    Updated,
+    Path,
+    Missing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadRequest {
+    pub mode: SourceMode,
+    pub directory: String,
+    pub links: Vec<String>,
+    pub files: Vec<String>,
+    pub raw_args: String,
+    pub limit: u8,
+    pub threads: u8,
+    pub pool: u8,
+    pub group: bool,
+    pub include: String,
+    pub exclude: String,
+    pub template: String,
+    pub skip_same: bool,
+    pub continue_last: bool,
+    pub restart: bool,
+    pub desc: bool,
+    pub takeout: bool,
+    pub rewrite_ext: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SourceMode {
+    Links,
+    Json,
+    Raw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DownloadStatus {
+    Downloading,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadRecord {
+    pub id: String,
+    pub task_id: String,
+    pub source: String,
+    pub mode: SourceMode,
+    pub directory: String,
+    pub status: DownloadStatus,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadStarted {
+    pub task_id: String,
+    pub command_preview: String,
+    pub records: Vec<DownloadRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadFileProgress {
+    pub key: String,
+    pub name: String,
+    pub progress: f64,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadEvent {
+    pub task_id: String,
+    pub kind: DownloadEventKind,
+    pub line: Option<String>,
+    pub progress: Option<f64>,
+    pub file_progress: Option<DownloadFileProgress>,
+    pub status: Option<DownloadStatus>,
+    pub message: Option<String>,
+    pub record_ids: Vec<String>,
+    pub completed_at: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DownloadEventKind {
+    Output,
+    Complete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPreview {
+    pub link: String,
+    pub chat: String,
+    pub message_id: u64,
+    pub text: Option<String>,
+    pub media_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginStatus {
+    pub logged_in: bool,
+    pub message: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginRequest {
+    pub method: LoginMethod,
+    pub desktop_path: Option<String>,
+    pub passcode: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoginMethod {
+    Desktop,
+    Qr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginStarted {
+    pub login_id: String,
+    pub method: LoginMethod,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginEvent {
+    pub login_id: String,
+    pub kind: LoginEventKind,
+    pub line: Option<String>,
+    pub qr: Option<String>,
+    pub status: Option<LoginResultStatus>,
+    pub message: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoginEventKind {
+    Output,
+    Qr,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoginResultStatus {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GitHubRelease {
+    pub assets: Vec<GitHubAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GitHubAsset {
+    pub name: String,
+    pub browser_download_url: String,
+}
