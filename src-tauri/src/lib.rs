@@ -30,6 +30,7 @@ pub fn run() {
             login::check_login_status,
             login::start_login,
             login::cancel_login,
+            login::logout,
             preview::preview_link,
         ])
         .run(tauri::generate_context!())

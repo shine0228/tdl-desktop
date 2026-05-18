@@ -1,12 +1,14 @@
 use std::{
+    fs,
     io::{BufRead, BufReader, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
+use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::{
@@ -28,11 +30,13 @@ pub fn check_login_status(
 ) -> Result<LoginStatus, String> {
     let tdl = resolve_tdl(&app, &state)?;
     if !tdl.available {
-        return Ok(LoginStatus {
-            logged_in: false,
-            message: "tdl 不可用，无法检查登录状态。".into(),
-            detail: None,
-        });
+        return Ok(login_status(
+            false,
+            "tdl 不可用，无法检查登录状态。",
+            None,
+            None,
+            None,
+        ));
     }
 
     let tdl_path = PathBuf::from(
@@ -50,20 +54,25 @@ pub fn check_login_status(
     let output = match run_with_timeout(command, LOGIN_CHECK_TIMEOUT) {
         Ok(output) => output,
         Err(error) => {
-            return Ok(LoginStatus {
-                logged_in: false,
-                message: "无法确认 Telegram 登录状态。".into(),
-                detail: Some(error),
-            });
+            return Ok(login_status(
+                false,
+                "无法确认 Telegram 登录状态。",
+                Some(error),
+                None,
+                None,
+            ));
         }
     };
 
     if output.status.success() {
-        return Ok(LoginStatus {
-            logged_in: true,
-            message: "tdl 已登录 Telegram。".into(),
-            detail: None,
-        });
+        let account = detect_account_from_chats(&output.stdout);
+        return Ok(login_status(
+            true,
+            "tdl 已登录 Telegram。",
+            None,
+            account.as_ref().and_then(|item| item.username.clone()),
+            account.and_then(|item| item.display_name),
+        ));
     }
 
     let detail = output_detail(&output.stdout, &output.stderr);
@@ -73,11 +82,13 @@ pub fn check_login_status(
         "无法确认 Telegram 登录状态。"
     };
 
-    Ok(LoginStatus {
-        logged_in: false,
-        message: message.into(),
-        detail: (!detail.is_empty()).then_some(detail),
-    })
+    Ok(login_status(
+        false,
+        message,
+        (!detail.is_empty()).then_some(detail),
+        None,
+        None,
+    ))
 }
 
 #[tauri::command]
@@ -144,6 +155,83 @@ pub fn cancel_login(state: State<'_, AppState>) -> Result<(), String> {
         let _ = child.kill();
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn logout(state: State<'_, AppState>) -> Result<LoginStatus, String> {
+    if !lock(&state.running)?.is_empty() {
+        return Err("当前还有下载任务在执行，请等任务结束或取消后再退出登录。".into());
+    }
+    if lock(&state.login)?.is_some() {
+        return Err("当前有登录流程在运行，请先取消或等待完成。".into());
+    }
+
+    let home = dirs::home_dir().ok_or_else(|| "无法定位用户目录，不能清理 tdl 登录态。".to_string())?;
+    let tdl_dir = home.join(".tdl");
+    remove_if_exists(&tdl_dir.join("data").join("default"))?;
+    remove_if_exists(&tdl_dir.join("data.kv"))?;
+
+    Ok(login_status(
+        false,
+        "已退出 Telegram 登录。",
+        None,
+        None,
+        None,
+    ))
+}
+
+#[derive(Debug)]
+struct AccountInfo {
+    username: Option<String>,
+    display_name: Option<String>,
+}
+
+fn login_status(
+    logged_in: bool,
+    message: &str,
+    detail: Option<String>,
+    username: Option<String>,
+    display_name: Option<String>,
+) -> LoginStatus {
+    LoginStatus {
+        logged_in,
+        message: message.into(),
+        detail,
+        username,
+        display_name,
+    }
+}
+
+fn detect_account_from_chats(stdout: &[u8]) -> Option<AccountInfo> {
+    let value: Value = serde_json::from_slice(stdout).ok()?;
+    let chats = value.as_array()?;
+    chats.iter().find_map(|item| {
+        let chat_type = get_string(item, "type")?;
+        let name = get_string(item, "visible_name").or_else(|| get_string(item, "name"));
+        let username = get_string(item, "username");
+        let is_self = chat_type.eq_ignore_ascii_case("self")
+            || name
+                .as_deref()
+                .is_some_and(|value| matches!(value, "Saved Messages" | "Saved messages" | "收藏夹"));
+        is_self.then_some(AccountInfo {
+            username,
+            display_name: name,
+        })
+    })
+}
+
+fn get_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(|value| match value {
+        Value::String(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
+        _ => None,
+    })
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(path).map_err(|error| format!("清理 tdl 登录态失败 ({}): {error}", path.display()))
 }
 
 fn build_login_args(request: &LoginRequest) -> Vec<String> {

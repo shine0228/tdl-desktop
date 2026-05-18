@@ -109,6 +109,22 @@ function formatFileSize(value?: number | null) {
   return `${size >= 10 || unit === 0 ? Math.round(size) : size.toFixed(1)} ${units[unit]}`;
 }
 
+function loggedInLabel(status: LoginStatus) {
+  if (status.username) return `已登录：@${status.username}`;
+  if (status.displayName) return `已登录：${status.displayName}`;
+  return status.message;
+}
+
+function loggedOutStatus(message: string, detail?: string | null): LoginStatus {
+  return {
+    loggedIn: false,
+    message,
+    detail: detail ?? null,
+    username: null,
+    displayName: null,
+  };
+}
+
 function tdlSourceLabel(info: TdlInfo | null) {
   if (!info || !info.available) return "tdl 不可用";
   const source =
@@ -201,11 +217,9 @@ function App() {
   const [linkPreview, setLinkPreview] = useState<PreviewState>({ status: "idle" });
   const [progress, setProgress] = useState<number | null>(null);
   const [fileProgresses, setFileProgresses] = useState<DownloadFileProgress[]>([]);
-  const [loginStatus, setLoginStatus] = useState<LoginStatus>({
-    loggedIn: false,
-    message: "尚未检查登录状态",
-    detail: null,
-  });
+  const [loginStatus, setLoginStatus] = useState<LoginStatus>(
+    loggedOutStatus("尚未检查登录状态"),
+  );
   const [loginChecking, setLoginChecking] = useState(false);
   const [loginRunning, setLoginRunning] = useState(false);
   const [loginQr, setLoginQr] = useState("");
@@ -440,11 +454,7 @@ function App() {
       if (state.tdl.available) {
         void refreshLoginStatus();
       } else {
-        setLoginStatus({
-          loggedIn: false,
-          message: "tdl 不可用，无法检查 Telegram 登录状态。",
-          detail: null,
-        });
+        setLoginStatus(loggedOutStatus("tdl 不可用，无法检查 Telegram 登录状态。"));
       }
     } catch (error) {
       setMessage(String(error));
@@ -458,11 +468,7 @@ function App() {
       const status = await invoke<LoginStatus>("check_login_status");
       setLoginStatus(status);
     } catch (error) {
-      setLoginStatus({
-        loggedIn: false,
-        message: "无法检查 Telegram 登录状态。",
-        detail: String(error),
-      });
+      setLoginStatus(loggedOutStatus("无法检查 Telegram 登录状态。", String(error)));
     } finally {
       setLoginChecking(false);
     }
@@ -540,15 +546,15 @@ function App() {
     if (event.kind === "complete") {
       setLoginRunning(false);
       const completed = event.status === "completed";
-      setLoginStatus({
-        loggedIn: completed,
-        message: event.message ?? (completed ? "登录完成" : "登录失败"),
-        detail: event.error,
-      });
-      setMessage(event.message ?? "");
+      setLoginQr("");
       if (completed) {
+        setLoginLogs([]);
+        setLoginStatus(loggedOutStatus(event.message ?? "登录完成"));
         void refreshLoginStatus();
+      } else {
+        setLoginStatus(loggedOutStatus(event.message ?? "登录失败", event.error));
       }
+      setMessage(event.message ?? "");
     }
   }
 
@@ -701,11 +707,9 @@ function App() {
     setLoginRunning(true);
     setLoginQr("");
     setLoginLogs([]);
-    setLoginStatus({
-      loggedIn: false,
-      message: method === "desktop" ? "正在连接 Telegram Desktop" : "正在生成 QR 登录码",
-      detail: null,
-    });
+    setLoginStatus(
+      loggedOutStatus(method === "desktop" ? "正在连接 Telegram Desktop" : "正在生成 QR 登录码"),
+    );
 
     try {
       const request = {
@@ -721,11 +725,7 @@ function App() {
       ]);
     } catch (error) {
       setLoginRunning(false);
-      setLoginStatus({
-        loggedIn: false,
-        message: "启动登录失败",
-        detail: String(error),
-      });
+      setLoginStatus(loggedOutStatus("启动登录失败", String(error)));
       setMessage(String(error));
     }
   }
@@ -733,11 +733,24 @@ function App() {
   async function cancelLogin() {
     if (!inTauri() || !loginRunning) return;
     await invoke("cancel_login");
-    setLoginStatus({
-      loggedIn: false,
-      message: "正在取消登录",
-      detail: null,
-    });
+    setLoginStatus(loggedOutStatus("正在取消登录"));
+  }
+
+  async function logout() {
+    if (!inTauri() || loginRunning) return;
+    setBusy(true);
+    setMessage("正在退出登录");
+    try {
+      const status = await invoke<LoginStatus>("logout");
+      setLoginStatus(status);
+      setLoginQr("");
+      setLoginLogs([]);
+      setMessage(status.message);
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function clearHistory() {
@@ -994,6 +1007,7 @@ function App() {
               onDesktopLogin={() => void startLogin("desktop")}
               onQrLogin={() => void startLogin("qr")}
               onCancel={() => void cancelLogin()}
+              onLogout={() => void logout()}
             />
 
             <div className="activity-panel">
@@ -1120,6 +1134,7 @@ function LoginPanel({
   onDesktopLogin,
   onQrLogin,
   onCancel,
+  onLogout,
 }: {
   status: LoginStatus;
   checking: boolean;
@@ -1135,6 +1150,7 @@ function LoginPanel({
   onDesktopLogin: () => void;
   onQrLogin: () => void;
   onCancel: () => void;
+  onLogout: () => void;
 }) {
   const StatusIcon = status.loggedIn ? ShieldCheck : running || checking ? LoaderCircle : AlertCircle;
 
@@ -1149,47 +1165,58 @@ function LoginPanel({
 
       <div className={`login-state ${status.loggedIn ? "ready" : "warning"} ${checking || running ? "loading" : ""}`}>
         <StatusIcon size={17} />
-        <span>{status.message}</span>
+        <span>{status.loggedIn ? loggedInLabel(status) : status.message}</span>
       </div>
       {status.detail ? <p className="login-detail">{status.detail}</p> : null}
 
-      <div className="login-fields">
-        <label className="field compact">
-          <span>Desktop 数据目录</span>
-          <input
-            value={desktopPath}
-            onChange={(event) => onDesktopPathChange(event.target.value)}
-            placeholder="留空自动查找"
-          />
-        </label>
-        <label className="field compact">
-          <span>Desktop 本地密码</span>
-          <input
-            type="password"
-            value={desktopPasscode}
-            onChange={(event) => onDesktopPasscodeChange(event.target.value)}
-            placeholder="无密码可留空"
-          />
-        </label>
-      </div>
+      {!status.loggedIn || running ? (
+        <>
+          <div className="login-fields">
+            <label className="field compact">
+              <span>Desktop 数据目录</span>
+              <input
+                value={desktopPath}
+                onChange={(event) => onDesktopPathChange(event.target.value)}
+                placeholder="留空自动查找"
+              />
+            </label>
+            <label className="field compact">
+              <span>Desktop 本地密码</span>
+              <input
+                type="password"
+                value={desktopPasscode}
+                onChange={(event) => onDesktopPasscodeChange(event.target.value)}
+                placeholder="无密码可留空"
+              />
+            </label>
+          </div>
 
-      <div className="login-actions">
-        <button className="ghost-button" onClick={onDesktopLogin} disabled={disabled || running || checking}>
-          <LogIn size={16} />
-          连接 Desktop
-        </button>
-        <button className="ghost-button" onClick={onQrLogin} disabled={disabled || running || checking}>
-          <QrCode size={16} />
-          QR 登录
-        </button>
-        <button className="danger-button" onClick={onCancel} disabled={!running}>
-          <Square size={16} />
-          取消
-        </button>
-      </div>
+          <div className="login-actions">
+            <button className="ghost-button" onClick={onDesktopLogin} disabled={disabled || running || checking}>
+              <LogIn size={16} />
+              连接 Desktop
+            </button>
+            <button className="ghost-button" onClick={onQrLogin} disabled={disabled || running || checking}>
+              <QrCode size={16} />
+              QR 登录
+            </button>
+            <button className="danger-button" onClick={onCancel} disabled={!running}>
+              <Square size={16} />
+              取消
+            </button>
+          </div>
+        </>
+      ) : (
+        <div className="login-actions">
+          <button className="danger-button" onClick={onLogout} disabled={disabled || checking}>
+            <LogIn size={16} />
+            退出登录
+          </button>
+        </div>
+      )}
 
-      {qr ? <pre className="qr-box">{qr}</pre> : null}
-      {logs.length ? (
+      {!status.loggedIn && qr ? <pre className="qr-box">{qr}</pre> : null}
+      {!status.loggedIn && logs.length ? (
         <div className="login-log">
           {logs.map((line, index) => (
             <p key={`${line}-${index}`}>{line}</p>

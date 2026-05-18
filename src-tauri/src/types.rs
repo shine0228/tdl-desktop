@@ -188,6 +188,8 @@ pub struct LoginStatus {
     pub logged_in: bool,
     pub message: String,
     pub detail: Option<String>,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
