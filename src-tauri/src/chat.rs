@@ -33,22 +33,26 @@ struct PreviewContext {
 }
 
 #[tauri::command]
-pub fn list_chats(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<ChatInfo>, String> {
+pub async fn list_chats(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<ChatInfo>, String> {
     let tdl_path = resolve_tdl_path(&app, &state)?;
-    let args = vec![
-        "chat".to_string(),
-        "ls".to_string(),
-        "-o".to_string(),
-        "json".to_string(),
-    ];
-    let output = run_tdl_with_timeout(&tdl_path, &args, CHAT_LIST_TIMEOUT)?;
-    let value: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("解析对话列表失败: {error}"))?;
-    let items = value
-        .as_array()
-        .ok_or_else(|| "tdl 返回的对话列表格式不正确。".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let args = vec![
+            "chat".to_string(),
+            "ls".to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ];
+        let output = run_tdl_with_timeout(&tdl_path, &args, CHAT_LIST_TIMEOUT)?;
+        let value: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("解析对话列表失败: {error}"))?;
+        let items = value
+            .as_array()
+            .ok_or_else(|| "tdl 返回的对话列表格式不正确。".to_string())?;
 
-    Ok(items.iter().filter_map(parse_chat_info).collect())
+        Ok(items.iter().filter_map(parse_chat_info).collect())
+    })
+    .await
+    .map_err(|error| format!("读取对话列表失败: {error}"))?
 }
 
 #[tauri::command]
