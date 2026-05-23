@@ -54,6 +54,7 @@ import type {
   LinkPreview,
   SourceMode,
   TdlInfo,
+  TdlUpdateEvent,
   TgLiteChat,
   TgLiteEvent,
   TgLiteStatus,
@@ -324,6 +325,7 @@ function App() {
   const [mediaPreviews, setMediaPreviews] = useState<Record<number, MediaPreviewState>>({});
   const [message, setMessage] = useState("正在加载");
   const [busy, setBusy] = useState(false);
+  const [tdlUpdateChecking, setTdlUpdateChecking] = useState(false);
 
   const configSaveTimer = useRef<number | null>(null);
   const pendingConfigRef = useRef<AppConfig | null>(null);
@@ -398,6 +400,7 @@ function App() {
     let cancelled = false;
     let unlistenDownload: (() => void) | undefined;
     let unlistenLogin: (() => void) | undefined;
+    let unlistenTdlUpdate: (() => void) | undefined;
 
     listen<DownloadEvent>("download-event", (event) => {
       handleDownloadEvent(event.payload);
@@ -431,10 +434,27 @@ function App() {
         }
       });
 
+    listen<TdlUpdateEvent>("tdl-update-event", (event) => {
+      handleTdlUpdateEvent(event.payload);
+    })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlistenTdlUpdate = fn;
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          console.error("订阅 tdl-update-event 失败", error);
+        }
+      });
+
     return () => {
       cancelled = true;
       unlistenDownload?.();
       unlistenLogin?.();
+      unlistenTdlUpdate?.();
     };
   }, []);
 
@@ -659,6 +679,14 @@ function App() {
       }
       setMessage(event.message ?? "");
     }
+  }
+
+  function handleTdlUpdateEvent(event: TdlUpdateEvent) {
+    setTdlUpdateChecking(false);
+    if (event.tdl) {
+      setTdl(event.tdl);
+    }
+    setMessage(event.message);
   }
 
   async function saveConfig(next: AppConfig) {
@@ -929,19 +957,15 @@ function App() {
     setMessage("正在取消");
   }
 
-  async function updateTdl() {
-    if (!inTauri()) return;
-    setBusy(true);
-    setMessage("正在更新 tdl");
+  async function checkTdlUpdate() {
+    if (!inTauri() || tdlUpdateChecking) return;
+    setTdlUpdateChecking(true);
+    setMessage("正在后台检查 tdl 更新");
     try {
-      const info = await invoke<TdlInfo>("update_tdl");
-      setTdl(info);
-      setMessage(info.available ? "tdl 已更新" : "tdl 不可用");
-      await loadState();
+      await invoke("update_tdl");
     } catch (error) {
+      setTdlUpdateChecking(false);
       setMessage(String(error));
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -1037,9 +1061,9 @@ function App() {
               <RefreshCcw size={16} />
               刷新
             </button>
-            <button className="ghost-button" onClick={updateTdl} disabled={busy}>
+            <button className="ghost-button" onClick={checkTdlUpdate} disabled={tdlUpdateChecking}>
               <RotateCw size={16} />
-              更新 tdl
+              {tdlUpdateChecking ? "检查中" : "检查更新"}
             </button>
           </div>
         </header>

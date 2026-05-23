@@ -28,6 +28,7 @@ pub struct AppState {
     pub cancelled: Arc<Mutex<HashSet<String>>>,
     pub login: Arc<Mutex<Option<Arc<Mutex<Child>>>>>,
     pub login_cancelled: Arc<Mutex<bool>>,
+    pub tdl_update_running: Arc<Mutex<bool>>,
     pub next_id: AtomicU64,
 }
 
@@ -49,6 +50,7 @@ impl AppState {
             cancelled: Arc::new(Mutex::new(HashSet::new())),
             login: Arc::new(Mutex::new(None)),
             login_cancelled: Arc::new(Mutex::new(false)),
+            tdl_update_running: Arc::new(Mutex::new(false)),
             next_id: AtomicU64::new(seed),
         }
     }

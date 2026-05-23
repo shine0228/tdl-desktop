@@ -326,6 +326,21 @@ pub enum LoginResultStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TdlUpdateEvent {
+    pub status: TdlUpdateStatus,
+    pub tdl: Option<TdlInfo>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TdlUpdateStatus {
+    Completed,
+    Failed,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct GitHubRelease {
     pub assets: Vec<GitHubAsset>,

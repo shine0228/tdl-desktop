@@ -216,3 +216,11 @@ export interface LoginEvent {
   message?: string | null;
   error?: string | null;
 }
+
+export type TdlUpdateStatus = "completed" | "failed";
+
+export interface TdlUpdateEvent {
+  status: TdlUpdateStatus;
+  tdl?: TdlInfo | null;
+  message: string;
+}

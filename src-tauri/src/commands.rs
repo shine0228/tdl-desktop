@@ -6,13 +6,16 @@ use std::{
 };
 
 use chrono::Utc;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
     download::{build_download_args, build_records, spawn_output_reader, spawn_process_monitor},
     state::AppState,
     tdl::{resolve_tdl, update_tdl as update_tdl_impl},
-    types::{AppConfig, AppSnapshot, DownloadRequest, DownloadStarted, SourceMode, TdlInfo},
+    types::{
+        AppConfig, AppSnapshot, DownloadRequest, DownloadStarted, SourceMode, TdlInfo,
+        TdlUpdateEvent, TdlUpdateStatus,
+    },
     util::{apply_hidden_process_flags, lock, preview_command},
 };
 
@@ -154,6 +157,40 @@ pub fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn update_tdl(app: AppHandle, state: State<'_, AppState>) -> Result<TdlInfo, String> {
-    update_tdl_impl(&app, &state)
+pub fn update_tdl(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let mut running = lock(&state.tdl_update_running)?;
+        if *running {
+            return Err("正在检查 tdl 更新，请稍候。".into());
+        }
+        *running = true;
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = app
+            .try_state::<AppState>()
+            .ok_or_else(|| "应用状态不可用。".to_string())
+            .and_then(|app_state| update_tdl_impl(&app, app_state.inner()));
+        if let Some(app_state) = app.try_state::<AppState>() {
+            if let Ok(mut running) = app_state.tdl_update_running.lock() {
+                *running = false;
+            }
+        }
+
+        let event = match result {
+            Ok(info) => TdlUpdateEvent {
+                status: TdlUpdateStatus::Completed,
+                tdl: Some(info),
+                message: "tdl 已更新。".into(),
+            },
+            Err(error) => TdlUpdateEvent {
+                status: TdlUpdateStatus::Failed,
+                tdl: None,
+                message: error,
+            },
+        };
+        let _ = app.emit("tdl-update-event", event);
+    });
+
+    Ok(())
 }
