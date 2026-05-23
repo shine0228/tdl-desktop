@@ -14,10 +14,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::{
     state::AppState,
     tdl::resolve_tdl,
-    types::{
-        LoginEvent, LoginEventKind, LoginMethod, LoginRequest, LoginResultStatus, LoginStarted,
-        LoginStatus,
-    },
+    types::{LoginEvent, LoginEventKind, LoginMethod, LoginRequest, LoginResultStatus, LoginStarted, LoginStatus},
     util::{apply_hidden_process_flags, lock, strip_ansi},
 };
 
@@ -44,9 +41,18 @@ pub async fn check_login_status(
             .ok_or_else(|| "tdl 路径不可用，无法检查登录状态。".to_string())?,
     );
 
-    tauri::async_runtime::spawn_blocking(move || check_login_status_with_tdl(tdl_path))
-        .await
-        .map_err(|error| format!("检查 Telegram 登录状态失败: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        check_login_status_with_helper_or_tdl(app, tdl_path)
+    })
+    .await
+    .map_err(|error| format!("检查 Telegram 登录状态失败: {error}"))?
+}
+
+fn check_login_status_with_helper_or_tdl(
+    _app: AppHandle,
+    tdl_path: PathBuf,
+) -> Result<LoginStatus, String> {
+    check_login_status_with_tdl(tdl_path)
 }
 
 fn check_login_status_with_tdl(tdl_path: PathBuf) -> Result<LoginStatus, String> {
@@ -173,7 +179,8 @@ pub fn logout(state: State<'_, AppState>) -> Result<LoginStatus, String> {
         return Err("当前有登录流程在运行，请先取消或等待完成。".into());
     }
 
-    let home = dirs::home_dir().ok_or_else(|| "无法定位用户目录，不能清理 tdl 登录态。".to_string())?;
+    let home =
+        dirs::home_dir().ok_or_else(|| "无法定位用户目录，不能清理 tdl 登录态。".to_string())?;
     let tdl_dir = home.join(".tdl");
     remove_if_exists(&tdl_dir.join("data").join("default"))?;
     remove_if_exists(&tdl_dir.join("data.kv"))?;
@@ -217,9 +224,9 @@ fn detect_account_from_chats(stdout: &[u8]) -> Option<AccountInfo> {
         let name = get_string(item, "visible_name").or_else(|| get_string(item, "name"));
         let username = get_string(item, "username");
         let is_self = chat_type.eq_ignore_ascii_case("self")
-            || name
-                .as_deref()
-                .is_some_and(|value| matches!(value, "Saved Messages" | "Saved messages" | "收藏夹"));
+            || name.as_deref().is_some_and(|value| {
+                matches!(value, "Saved Messages" | "Saved messages" | "收藏夹")
+            });
         is_self.then_some(AccountInfo {
             username,
             display_name: name,
@@ -238,7 +245,8 @@ fn remove_if_exists(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
-    fs::remove_file(path).map_err(|error| format!("清理 tdl 登录态失败 ({}): {error}", path.display()))
+    fs::remove_file(path)
+        .map_err(|error| format!("清理 tdl 登录态失败 ({}): {error}", path.display()))
 }
 
 fn build_login_args(request: &LoginRequest) -> Vec<String> {
