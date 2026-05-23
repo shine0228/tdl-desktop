@@ -245,8 +245,12 @@ fn remove_if_exists(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
-    fs::remove_file(path)
-        .map_err(|error| format!("清理 tdl 登录态失败 ({}): {error}", path.display()))
+    let result = if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.map_err(|error| format!("清理 tdl 登录态失败 ({}): {error}", path.display()))
 }
 
 fn build_login_args(request: &LoginRequest) -> Vec<String> {
