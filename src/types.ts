@@ -1,4 +1,4 @@
-export type SourceMode = "links" | "json" | "raw" | "chat";
+export type SourceMode = "links" | "json" | "raw" | "chat" | "tgLite";
 
 export type DownloadStatus =
   | "downloading"
@@ -12,6 +12,8 @@ export interface AppConfig {
   threads: number;
   pool: number;
   tdlOverridePath?: string | null;
+  tgLiteApiId?: string;
+  tgLiteApiHash?: string;
 }
 
 export interface TdlInfo {
@@ -99,10 +101,62 @@ export interface MessageInfo {
   id: number;
   date?: string | null;
   text?: string | null;
+  mediaKind: MediaKind;
   mediaType?: string | null;
+  mimeType?: string | null;
   fileName?: string | null;
   fileSize?: number | null;
+  width?: number | null;
+  height?: number | null;
+  duration?: number | null;
+  previewable: boolean;
 }
+
+export type MediaKind = "none" | "photo" | "video" | "audio" | "document" | "unknown";
+
+export interface ChatMediaPreview {
+  chatId: string;
+  messageId: number;
+  files: ChatMediaPreviewFile[];
+}
+
+export interface ChatMediaPreviewFile {
+  path: string;
+  fileName: string;
+  mediaKind: MediaKind;
+  mimeType?: string | null;
+  size?: number | null;
+}
+
+export interface TgLiteStatus {
+  configured: boolean;
+  initialized: boolean;
+  authorized: boolean;
+  state: string;
+  message: string;
+  qrLink?: string | null;
+  username?: string | null;
+  displayName?: string | null;
+}
+
+export interface TgLiteChat {
+  id: number;
+  title: string;
+  chatType: string;
+  unreadCount: number;
+  lastMessageId?: number | null;
+  lastMessageText?: string | null;
+  order?: string | null;
+}
+
+export type TgLiteEvent =
+  | { kind: "status"; status: TgLiteStatus }
+  | { kind: "connection"; state: string }
+  | { kind: "chatUpsert"; chat: TgLiteChat }
+  | { kind: "chatDelete"; chatId: number }
+  | { kind: "messageNew"; chatId: number; message: MessageInfo }
+  | { kind: "messageUpdate"; chatId: number; messageId: number; message?: MessageInfo | null }
+  | { kind: "messageDelete"; chatId: number; messageIds: number[] };
 
 export interface DownloadStarted {
   taskId: string;

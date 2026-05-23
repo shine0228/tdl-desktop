@@ -8,6 +8,10 @@ pub struct AppConfig {
     pub threads: u8,
     pub pool: u8,
     pub tdl_override_path: Option<String>,
+    #[serde(default)]
+    pub tg_lite_api_id: String,
+    #[serde(default)]
+    pub tg_lite_api_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +92,7 @@ pub enum SourceMode {
     Json,
     Raw,
     Chat,
+    TgLite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,9 +182,88 @@ pub struct MessageInfo {
     pub id: i64,
     pub date: Option<String>,
     pub text: Option<String>,
+    pub media_kind: MediaKind,
     pub media_type: Option<String>,
+    pub mime_type: Option<String>,
     pub file_name: Option<String>,
     pub file_size: Option<i64>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub duration: Option<i64>,
+    pub previewable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MediaKind {
+    None,
+    Photo,
+    Video,
+    Audio,
+    Document,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMediaPreview {
+    pub chat_id: String,
+    pub message_id: i64,
+    pub files: Vec<ChatMediaPreviewFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMediaPreviewFile {
+    pub path: String,
+    pub file_name: String,
+    pub media_kind: MediaKind,
+    pub mime_type: Option<String>,
+    pub size: Option<i64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TgLiteStatus {
+    pub configured: bool,
+    pub initialized: bool,
+    pub authorized: bool,
+    pub state: String,
+    pub message: String,
+    pub qr_link: Option<String>,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TgLiteChat {
+    pub id: i64,
+    pub title: String,
+    pub chat_type: String,
+    pub unread_count: i32,
+    pub last_message_id: Option<i64>,
+    pub last_message_text: Option<String>,
+    pub order: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum TgLiteEvent {
+    Status { status: TgLiteStatus },
+    Connection { state: String },
+    ChatUpsert { chat: TgLiteChat },
+    ChatDelete { chat_id: i64 },
+    MessageNew { chat_id: i64, message: MessageInfo },
+    MessageUpdate {
+        chat_id: i64,
+        message_id: i64,
+        message: Option<MessageInfo>,
+    },
+    MessageDelete { chat_id: i64, message_ids: Vec<i64> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

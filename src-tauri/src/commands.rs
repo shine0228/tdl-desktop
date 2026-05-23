@@ -67,6 +67,9 @@ pub fn start_download(
     if !tdl.available {
         return Err("未找到可用的 tdl.exe。发布包应内置 tdl.exe,也可以手动更新 tdl。".into());
     }
+    if request.mode == SourceMode::TgLite {
+        return Err("TG Lite 模式请在 TG Lite 页面选择消息下载。".into());
+    }
 
     let tdl_path = PathBuf::from(
         tdl.path

@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
@@ -9,21 +9,28 @@ use std::{
 
 use chrono::Utc;
 use serde_json::Value;
-use tauri::{AppHandle, State};
+use tauri::{path::BaseDirectory, AppHandle, Manager, State};
 
 use crate::{
     download::{spawn_output_reader, spawn_process_monitor_with_cleanup},
     state::AppState,
     tdl::resolve_tdl,
     types::{
-        ChatDownloadRequest, ChatInfo, DownloadRecord, DownloadStarted, DownloadStatus,
-        MessageInfo, SourceMode,
+        AppConfig, ChatDownloadRequest, ChatInfo, ChatMediaPreview, ChatMediaPreviewFile,
+        DownloadRecord, DownloadStarted, DownloadStatus, MediaKind, MessageInfo, SourceMode,
     },
     util::{apply_hidden_process_flags, lock, preview_command, run_with_timeout},
 };
 
 const CHAT_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 const CHAT_EXPORT_TIMEOUT: Duration = Duration::from_secs(90);
+const MEDIA_PREVIEW_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[derive(Clone)]
+struct PreviewContext {
+    app_dir: PathBuf,
+    config: Arc<Mutex<AppConfig>>,
+}
 
 #[tauri::command]
 pub fn list_chats(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<ChatInfo>, String> {
@@ -91,29 +98,16 @@ pub fn download_from_chat(
     fs::create_dir_all(directory).map_err(|error| format!("无法创建下载目录: {error}"))?;
 
     let tdl_path = resolve_tdl_path(&app, &state)?;
-    let export_path = temp_chat_json(&state, "selected")?;
     let mut selected_ids = request.message_ids.clone();
     selected_ids.sort_unstable();
     selected_ids.dedup();
-    let selected_set: HashSet<i64> = selected_ids.iter().copied().collect();
-    let first_id = selected_ids[0];
-    let last_id = selected_ids[selected_ids.len() - 1];
-    let export_args = vec![
-        "chat".to_string(),
-        "export".to_string(),
-        "--with-content".to_string(),
-        "--all".to_string(),
-        "-T".to_string(),
-        "id".to_string(),
-        "-c".to_string(),
-        request.chat_id.clone(),
-        "-i".to_string(),
-        format!("{first_id},{last_id}"),
-        "-o".to_string(),
-        export_path.to_string_lossy().to_string(),
-    ];
-    run_tdl_with_timeout(&tdl_path, &export_args, CHAT_EXPORT_TIMEOUT)?;
-    filter_exported_messages(&export_path, &selected_set)?;
+    let export_path = export_exact_messages(
+        &tdl_path,
+        &state,
+        &request.chat_id,
+        &selected_ids,
+        "selected",
+    )?;
 
     let download_args = build_chat_download_args(&request, &export_path);
     let mut command = Command::new(&tdl_path);
@@ -176,6 +170,109 @@ pub fn download_from_chat(
     })
 }
 
+#[tauri::command]
+pub async fn preview_chat_media(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    chat_id: String,
+    message_id: i64,
+) -> Result<ChatMediaPreview, String> {
+    let context = PreviewContext {
+        app_dir: state.app_dir.clone(),
+        config: Arc::clone(&state.config),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        preview_chat_media_blocking(app, context, chat_id, message_id)
+    })
+    .await
+    .map_err(|error| format!("预览任务执行失败: {error}"))?
+}
+
+fn preview_chat_media_blocking(
+    app: AppHandle,
+    context: PreviewContext,
+    chat_id: String,
+    message_id: i64,
+) -> Result<ChatMediaPreview, String> {
+    let tdl_path = resolve_tdl_path_for_preview(&app, &context)?;
+    let preview_dir = media_preview_dir_for(&context.app_dir, &chat_id, message_id);
+    fs::create_dir_all(&preview_dir).map_err(|error| format!("无法创建媒体预览目录: {error}"))?;
+
+    let mut files = collect_preview_files(&preview_dir)?;
+    if files.is_empty() {
+        let export_path = export_exact_messages_in_dir(
+            &tdl_path,
+            &context.app_dir,
+            &chat_id,
+            &[message_id],
+            "preview",
+        )?;
+        let args = vec![
+            "download".to_string(),
+            "-d".to_string(),
+            preview_dir.to_string_lossy().to_string(),
+            "-l".to_string(),
+            "1".to_string(),
+            "-t".to_string(),
+            "1".to_string(),
+            "-f".to_string(),
+            export_path.to_string_lossy().to_string(),
+            "--skip-same".to_string(),
+            "--pool".to_string(),
+            "1".to_string(),
+            "--template".to_string(),
+            "{{ .MessageID }}_{{ filenamify .FileName }}".to_string(),
+        ];
+
+        let result = run_tdl_with_timeout(&tdl_path, &args, MEDIA_PREVIEW_TIMEOUT);
+        let _ = fs::remove_file(&export_path);
+        result?;
+        files = collect_preview_files(&preview_dir)?;
+    }
+
+    if files.is_empty() {
+        return Err("这条消息没有可预览的媒体文件。".into());
+    }
+
+    Ok(ChatMediaPreview {
+        chat_id,
+        message_id,
+        files,
+    })
+}
+
+#[tauri::command]
+pub async fn cached_chat_media_preview(
+    state: State<'_, AppState>,
+    chat_id: String,
+    message_id: i64,
+) -> Result<Option<ChatMediaPreview>, String> {
+    let app_dir = state.app_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        cached_chat_media_preview_blocking(app_dir, chat_id, message_id)
+    })
+    .await
+    .map_err(|error| format!("读取预览缓存失败: {error}"))?
+}
+
+fn cached_chat_media_preview_blocking(
+    app_dir: PathBuf,
+    chat_id: String,
+    message_id: i64,
+) -> Result<Option<ChatMediaPreview>, String> {
+    let preview_dir = media_preview_dir_for(&app_dir, &chat_id, message_id);
+    let files = collect_preview_files(&preview_dir)?;
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(ChatMediaPreview {
+        chat_id,
+        message_id,
+        files,
+    }))
+}
+
 fn resolve_tdl_path(app: &AppHandle, state: &AppState) -> Result<PathBuf, String> {
     let tdl = resolve_tdl(app, state)?;
     if !tdl.available {
@@ -184,6 +281,63 @@ fn resolve_tdl_path(app: &AppHandle, state: &AppState) -> Result<PathBuf, String
     tdl.path
         .map(PathBuf::from)
         .ok_or_else(|| "tdl 路径不可用".to_string())
+}
+
+fn resolve_tdl_path_for_preview(
+    app: &AppHandle,
+    context: &PreviewContext,
+) -> Result<PathBuf, String> {
+    if let Some(path) = lock(&context.config)?.tdl_override_path.clone() {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+
+    if let Some(path) = bundled_tdl_path(app) {
+        return Ok(path);
+    }
+
+    let local_path = context.app_dir.join("bin").join("tdl.exe");
+    if local_path.is_file() {
+        return Ok(local_path);
+    }
+
+    find_tdl_in_path().ok_or_else(|| "未找到可用的 tdl.exe。".to_string())
+}
+
+fn bundled_tdl_path(app: &AppHandle) -> Option<PathBuf> {
+    let resource = app
+        .path()
+        .resolve("resources/tdl.exe", BaseDirectory::Resource)
+        .ok();
+
+    resource.filter(|path| path.is_file()).or_else(|| {
+        let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("tdl.exe");
+        dev_path.is_file().then_some(dev_path)
+    })
+}
+
+fn find_tdl_in_path() -> Option<PathBuf> {
+    let path_var = env::var_os("PATH")?;
+    let candidates = if cfg!(windows) {
+        vec!["tdl.exe"]
+    } else {
+        vec!["tdl"]
+    };
+
+    for dir in env::split_paths(&path_var) {
+        for candidate in &candidates {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+
+    None
 }
 
 fn run_tdl_with_timeout(
@@ -210,9 +364,168 @@ fn run_tdl_with_timeout(
 }
 
 fn temp_chat_json(state: &AppState, prefix: &str) -> Result<PathBuf, String> {
-    let dir = state.app_dir.join("chat");
+    temp_chat_json_in_dir(&state.app_dir, &state.next_id(prefix))
+}
+
+fn temp_chat_json_in_dir(app_dir: &Path, prefix: &str) -> Result<PathBuf, String> {
+    let dir = app_dir.join("chat");
     fs::create_dir_all(&dir).map_err(|error| format!("无法创建对话缓存目录: {error}"))?;
-    Ok(dir.join(format!("{}-{}.json", state.next_id(prefix), Utc::now().timestamp_millis())))
+    Ok(dir.join(format!("{}-{}.json", prefix, Utc::now().timestamp_millis())))
+}
+
+fn media_preview_dir_for(app_dir: &Path, chat_id: &str, message_id: i64) -> PathBuf {
+    app_dir
+        .join("previews")
+        .join(sanitize_file_name(chat_id))
+        .join(message_id.to_string())
+}
+
+fn collect_preview_files(directory: &Path) -> Result<Vec<ChatMediaPreviewFile>, String> {
+    let mut files = Vec::new();
+    collect_preview_files_inner(directory, &mut files)?;
+    files.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+    Ok(files)
+}
+
+fn collect_preview_files_inner(
+    directory: &Path,
+    files: &mut Vec<ChatMediaPreviewFile>,
+) -> Result<(), String> {
+    if !directory.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(directory).map_err(|error| format!("读取预览目录失败: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("读取预览文件失败: {error}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_preview_files_inner(&path, files)?;
+            continue;
+        }
+        if !path.is_file() || is_transient_file(&path) {
+            continue;
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("media")
+            .to_string();
+        let mime_type = mime_from_extension(&file_name);
+        let media_kind =
+            detect_media_kind(&Value::Null, Some(&file_name), mime_type.as_deref(), None);
+        if matches!(media_kind, MediaKind::None | MediaKind::Unknown) {
+            continue;
+        }
+        let size = path
+            .metadata()
+            .ok()
+            .and_then(|metadata| i64::try_from(metadata.len()).ok());
+        files.push(ChatMediaPreviewFile {
+            path: path.to_string_lossy().to_string(),
+            file_name,
+            media_kind,
+            mime_type,
+            size,
+        });
+    }
+
+    Ok(())
+}
+
+fn is_transient_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.ends_with(".json")
+        || name.ends_with(".tmp")
+        || name.ends_with(".part")
+        || name.ends_with(".downloading")
+}
+
+fn sanitize_file_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn export_exact_messages(
+    tdl_path: &Path,
+    state: &AppState,
+    chat_id: &str,
+    message_ids: &[i64],
+    prefix: &str,
+) -> Result<PathBuf, String> {
+    export_exact_messages_with_output(
+        tdl_path,
+        temp_chat_json(state, prefix)?,
+        chat_id,
+        message_ids,
+    )
+}
+
+fn export_exact_messages_in_dir(
+    tdl_path: &Path,
+    app_dir: &Path,
+    chat_id: &str,
+    message_ids: &[i64],
+    prefix: &str,
+) -> Result<PathBuf, String> {
+    let prefix = format!(
+        "{prefix}-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    export_exact_messages_with_output(
+        tdl_path,
+        temp_chat_json_in_dir(app_dir, &prefix)?,
+        chat_id,
+        message_ids,
+    )
+}
+
+fn export_exact_messages_with_output(
+    tdl_path: &Path,
+    output_path: PathBuf,
+    chat_id: &str,
+    message_ids: &[i64],
+) -> Result<PathBuf, String> {
+    if message_ids.is_empty() {
+        return Err("请至少选择一条消息。".into());
+    }
+    let mut selected_ids = message_ids.to_vec();
+    selected_ids.sort_unstable();
+    selected_ids.dedup();
+    let selected_set: HashSet<i64> = selected_ids.iter().copied().collect();
+    let first_id = selected_ids[0];
+    let last_id = selected_ids[selected_ids.len() - 1];
+    let export_args = vec![
+        "chat".to_string(),
+        "export".to_string(),
+        "--with-content".to_string(),
+        "--all".to_string(),
+        "-T".to_string(),
+        "id".to_string(),
+        "-c".to_string(),
+        chat_id.to_string(),
+        "-i".to_string(),
+        format!("{first_id},{last_id}"),
+        "-o".to_string(),
+        output_path.to_string_lossy().to_string(),
+    ];
+
+    run_tdl_with_timeout(tdl_path, &export_args, CHAT_EXPORT_TIMEOUT)?;
+    filter_exported_messages(&output_path, &selected_set)?;
+    Ok(output_path)
 }
 
 fn build_chat_download_args(request: &ChatDownloadRequest, file: &Path) -> Vec<String> {
@@ -235,7 +548,10 @@ fn build_chat_download_args(request: &ChatDownloadRequest, file: &Path) -> Vec<S
     push_csv_arg(&mut args, "-i", &request.include);
     push_csv_arg(&mut args, "-e", &request.exclude);
     if !request.template.trim().is_empty() {
-        args.extend(["--template".to_string(), request.template.trim().to_string()]);
+        args.extend([
+            "--template".to_string(),
+            request.template.trim().to_string(),
+        ]);
     }
     if request.skip_same {
         args.push("--skip-same".to_string());
@@ -279,27 +595,37 @@ fn parse_chat_info(value: &Value) -> Option<ChatInfo> {
 
 fn parse_messages_file(path: &Path) -> Result<Vec<MessageInfo>, String> {
     let content = fs::read_to_string(path).map_err(|error| format!("读取消息列表失败: {error}"))?;
-    let value: Value = serde_json::from_str(&content).map_err(|error| format!("解析消息列表失败: {error}"))?;
-    let messages = find_messages(&value).ok_or_else(|| "tdl 导出结果里没有 messages 数组。".to_string())?;
+    let value: Value =
+        serde_json::from_str(&content).map_err(|error| format!("解析消息列表失败: {error}"))?;
+    let messages =
+        find_messages(&value).ok_or_else(|| "tdl 导出结果里没有 messages 数组。".to_string())?;
     Ok(messages.iter().filter_map(parse_message_info).collect())
 }
 
 fn filter_exported_messages(path: &Path, selected_ids: &HashSet<i64>) -> Result<(), String> {
-    let content = fs::read_to_string(path).map_err(|error| format!("读取已导出的消息失败: {error}"))?;
-    let mut value: Value = serde_json::from_str(&content).map_err(|error| format!("解析已导出的消息失败: {error}"))?;
+    let content =
+        fs::read_to_string(path).map_err(|error| format!("读取已导出的消息失败: {error}"))?;
+    let mut value: Value =
+        serde_json::from_str(&content).map_err(|error| format!("解析已导出的消息失败: {error}"))?;
     let kept = filter_messages_in_value(&mut value, selected_ids)?;
     if kept == 0 {
         return Err("tdl 已导出消息范围，但没有找到已勾选的消息。".into());
     }
-    let content = serde_json::to_string_pretty(&value).map_err(|error| format!("序列化已筛选消息失败: {error}"))?;
+    let content = serde_json::to_string_pretty(&value)
+        .map_err(|error| format!("序列化已筛选消息失败: {error}"))?;
     fs::write(path, content).map_err(|error| format!("写入已筛选消息失败: {error}"))
 }
 
-fn filter_messages_in_value(value: &mut Value, selected_ids: &HashSet<i64>) -> Result<usize, String> {
+fn filter_messages_in_value(
+    value: &mut Value,
+    selected_ids: &HashSet<i64>,
+) -> Result<usize, String> {
     match value {
         Value::Object(map) => {
             if let Some(Value::Array(messages)) = map.get_mut("messages") {
-                messages.retain(|message| message_id(message).is_some_and(|id| selected_ids.contains(&id)));
+                messages.retain(|message| {
+                    message_id(message).is_some_and(|id| selected_ids.contains(&id))
+                });
                 return Ok(messages.len());
             }
             for child in map.values_mut() {
@@ -311,7 +637,8 @@ fn filter_messages_in_value(value: &mut Value, selected_ids: &HashSet<i64>) -> R
             Ok(0)
         }
         Value::Array(items) => {
-            items.retain(|message| message_id(message).is_some_and(|id| selected_ids.contains(&id)));
+            items
+                .retain(|message| message_id(message).is_some_and(|id| selected_ids.contains(&id)));
             Ok(items.len())
         }
         _ => Err("tdl 导出结果里没有可筛选的 messages 数组。".into()),
@@ -319,7 +646,17 @@ fn filter_messages_in_value(value: &mut Value, selected_ids: &HashSet<i64>) -> R
 }
 
 fn message_id(value: &Value) -> Option<i64> {
-    get_i64(value, &["id", "ID", "message_id", "messageId", "MessageID", "MessageId"])
+    get_i64(
+        value,
+        &[
+            "id",
+            "ID",
+            "message_id",
+            "messageId",
+            "MessageID",
+            "MessageId",
+        ],
+    )
 }
 
 fn find_messages(value: &Value) -> Option<&Vec<Value>> {
@@ -337,13 +674,37 @@ fn find_messages(value: &Value) -> Option<&Vec<Value>> {
 
 fn parse_message_info(value: &Value) -> Option<MessageInfo> {
     let id = message_id(value)?;
+    let file_name = find_file_name(value);
+    let mime_type =
+        find_mime_type(value).or_else(|| file_name.as_deref().and_then(mime_from_extension));
+    let media_type = find_media_type(value);
+    let media_kind = detect_media_kind(
+        value,
+        file_name.as_deref(),
+        mime_type.as_deref(),
+        media_type.as_deref(),
+    );
     Some(MessageInfo {
         id,
-        date: get_string(value, &["date", "Date", "created_at", "createdAt"]),
+        date: get_date_string(value, &["date", "Date", "created_at", "createdAt"]),
         text: find_text(value).map(|text| compact_message(&text)),
-        media_type: find_media_type(value),
-        file_name: find_file_name(value),
+        media_kind,
+        media_type,
+        mime_type,
+        file_name,
         file_size: find_file_size(value),
+        width: find_dimension(value, &["width", "Width", "w"]),
+        height: find_dimension(value, &["height", "Height", "h"]),
+        duration: find_dimension(
+            value,
+            &[
+                "duration",
+                "Duration",
+                "duration_seconds",
+                "durationSeconds",
+            ],
+        ),
+        previewable: matches!(media_kind, MediaKind::Photo | MediaKind::Video),
     })
 }
 
@@ -367,21 +728,12 @@ fn find_text(value: &Value) -> Option<String> {
 }
 
 fn find_media_type(value: &Value) -> Option<String> {
-    const KEYS: &[&str] = &[
-        "media",
-        "mime_type",
-        "mimeType",
-        "mime",
-        "type",
-        "class_name",
-        "className",
-        "_",
-    ];
+    const KEYS: &[&str] = &["media", "class_name", "className", "_"];
     match value {
         Value::Object(map) => {
             for key in KEYS {
                 if let Some(Value::String(text)) = map.get(*key) {
-                    if !text.trim().is_empty() {
+                    if is_specific_media_type(text) {
                         return Some(text.trim().to_string());
                     }
                 }
@@ -393,15 +745,39 @@ fn find_media_type(value: &Value) -> Option<String> {
     }
 }
 
+fn find_mime_type(value: &Value) -> Option<String> {
+    const KEYS: &[&str] = &[
+        "mime_type",
+        "mimeType",
+        "mime",
+        "content_type",
+        "contentType",
+    ];
+    match value {
+        Value::Object(map) => {
+            for key in KEYS {
+                if let Some(Value::String(text)) = map.get(*key) {
+                    if !text.trim().is_empty() {
+                        return Some(text.trim().to_ascii_lowercase());
+                    }
+                }
+            }
+            map.values().find_map(find_mime_type)
+        }
+        Value::Array(items) => items.iter().find_map(find_mime_type),
+        _ => None,
+    }
+}
+
 fn find_file_name(value: &Value) -> Option<String> {
     const KEYS: &[&str] = &[
         "file_name",
         "fileName",
         "filename",
+        "file",
         "name",
         "title",
         "FileName",
-        "attributes",
     ];
     match value {
         Value::Object(map) => {
@@ -435,6 +811,161 @@ fn find_file_size(value: &Value) -> Option<i64> {
     }
 }
 
+fn find_dimension(value: &Value, keys: &[&str]) -> Option<i64> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(size) = map.get(*key).and_then(value_to_i64) {
+                    return Some(size);
+                }
+            }
+            map.values().find_map(|child| find_dimension(child, keys))
+        }
+        Value::Array(items) => items.iter().find_map(|child| find_dimension(child, keys)),
+        _ => None,
+    }
+}
+
+fn detect_media_kind(
+    value: &Value,
+    file_name: Option<&str>,
+    mime_type: Option<&str>,
+    media_type: Option<&str>,
+) -> MediaKind {
+    if let Some(mime) = mime_type {
+        if mime.starts_with("image/") {
+            return MediaKind::Photo;
+        }
+        if mime.starts_with("video/") {
+            return MediaKind::Video;
+        }
+        if mime.starts_with("audio/") {
+            return MediaKind::Audio;
+        }
+    }
+
+    if let Some(kind) = media_type.and_then(kind_from_text) {
+        return kind;
+    }
+
+    if let Some(name) = file_name {
+        if let Some(kind) = kind_from_extension(name) {
+            return kind;
+        }
+        return MediaKind::Document;
+    }
+
+    if has_key_recursive(value, &["photo", "Photo"]) {
+        return MediaKind::Photo;
+    }
+    if has_key_recursive(value, &["video", "Video"]) {
+        return MediaKind::Video;
+    }
+    if has_key_recursive(value, &["audio", "Audio", "voice", "Voice"]) {
+        return MediaKind::Audio;
+    }
+    if has_key_recursive(value, &["document", "Document", "file", "File"]) {
+        return MediaKind::Document;
+    }
+
+    MediaKind::None
+}
+
+fn kind_from_text(text: &str) -> Option<MediaKind> {
+    let text = text.to_ascii_lowercase();
+    if text.contains("photo") || text.contains("image") {
+        Some(MediaKind::Photo)
+    } else if text.contains("video") {
+        Some(MediaKind::Video)
+    } else if text.contains("audio") || text.contains("voice") {
+        Some(MediaKind::Audio)
+    } else if text.contains("document") || text.contains("file") {
+        Some(MediaKind::Document)
+    } else {
+        None
+    }
+}
+
+fn kind_from_extension(file_name: &str) -> Option<MediaKind> {
+    let extension = Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "heic" | "heif" => Some(MediaKind::Photo),
+        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "wmv" => Some(MediaKind::Video),
+        "mp3" | "m4a" | "aac" | "ogg" | "opus" | "wav" | "flac" => Some(MediaKind::Audio),
+        "" => None,
+        _ => Some(MediaKind::Document),
+    }
+}
+
+fn mime_from_extension(file_name: &str) -> Option<String> {
+    let extension = Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mime = match extension.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "heic" | "heif" => "image/heif",
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        "avi" => "video/x-msvideo",
+        "mp3" => "audio/mpeg",
+        "m4a" | "aac" => "audio/aac",
+        "ogg" | "opus" => "audio/ogg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+fn has_key_recursive(value: &Value, keys: &[&str]) -> bool {
+    match value {
+        Value::Object(map) => {
+            keys.iter().any(|key| map.contains_key(*key))
+                || map.values().any(|child| has_key_recursive(child, keys))
+        }
+        Value::Array(items) => items.iter().any(|child| has_key_recursive(child, keys)),
+        _ => false,
+    }
+}
+
+fn is_specific_media_type(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty() && !matches!(text, "message" | "Message")
+}
+
+fn get_date_string(value: &Value, keys: &[&str]) -> Option<String> {
+    let Value::Object(map) = value else {
+        return None;
+    };
+    keys.iter().find_map(|key| {
+        map.get(*key).and_then(|value| match value {
+            Value::String(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
+            Value::Number(number) => number.as_i64().map(|timestamp| {
+                if timestamp > 10_000_000_000 {
+                    chrono::DateTime::from_timestamp_millis(timestamp)
+                } else {
+                    chrono::DateTime::from_timestamp(timestamp, 0)
+                }
+                .map(|date| date.to_rfc3339())
+                .unwrap_or_else(|| timestamp.to_string())
+            }),
+            _ => None,
+        })
+    })
+}
+
 fn get_string(value: &Value, keys: &[&str]) -> Option<String> {
     let Value::Object(map) = value else {
         return None;
@@ -451,12 +982,15 @@ fn get_i64(value: &Value, keys: &[&str]) -> Option<i64> {
     let Value::Object(map) = value else {
         return None;
     };
-    keys.iter().find_map(|key| map.get(*key).and_then(value_to_i64))
+    keys.iter()
+        .find_map(|key| map.get(*key).and_then(value_to_i64))
 }
 
 fn value_to_i64(value: &Value) -> Option<i64> {
     match value {
-        Value::Number(number) => number.as_i64().or_else(|| number.as_u64().and_then(|v| i64::try_from(v).ok())),
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|v| i64::try_from(v).ok())),
         Value::String(text) => text.parse::<i64>().ok(),
         _ => None,
     }
@@ -481,4 +1015,70 @@ fn compact_message(message: &str) -> String {
         compact.push_str("...");
     }
     compact
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_exported_messages_to_selected_ids() {
+        let mut value = serde_json::json!({
+            "id": 100,
+            "messages": [
+                { "id": 4853, "file": "a.mp4" },
+                { "id": 4854, "file": "middle.mp4" },
+                { "id": 4855, "file": "b.jpg" }
+            ]
+        });
+        let selected = HashSet::from([4853, 4855]);
+
+        let kept = filter_messages_in_value(&mut value, &selected).unwrap();
+        let ids = value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message_id(message).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(kept, 2);
+        assert_eq!(ids, vec![4853, 4855]);
+    }
+
+    #[test]
+    fn parses_file_field_as_video_media() {
+        let value = serde_json::json!({
+            "id": 4853,
+            "type": "message",
+            "file": "6069126377972440177.mp4",
+            "date": 1778955294,
+            "text": "caption"
+        });
+
+        let message = parse_message_info(&value).unwrap();
+
+        assert_eq!(message.media_kind, MediaKind::Video);
+        assert_eq!(
+            message.file_name.as_deref(),
+            Some("6069126377972440177.mp4")
+        );
+        assert_eq!(message.mime_type.as_deref(), Some("video/mp4"));
+        assert!(message.previewable);
+        assert!(message.date.is_some());
+    }
+
+    #[test]
+    fn ignores_generic_message_type_for_text_messages() {
+        let value = serde_json::json!({
+            "id": 1,
+            "type": "message",
+            "text": "hello"
+        });
+
+        let message = parse_message_info(&value).unwrap();
+
+        assert_eq!(message.media_kind, MediaKind::None);
+        assert_eq!(message.media_type, None);
+        assert!(!message.previewable);
+    }
 }

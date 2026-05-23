@@ -107,5 +107,7 @@ fn default_config() -> AppConfig {
         threads: 4,
         pool: 8,
         tdl_override_path: None,
+        tg_lite_api_id: String::new(),
+        tg_lite_api_hash: String::new(),
     }
 }

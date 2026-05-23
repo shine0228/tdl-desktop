@@ -13,6 +13,8 @@ target/
 src-tauri/target/
 src-tauri/gen/
 src-tauri/resources/tdl.exe
+src-tauri/resources/tdl-helper.exe
+helper/tdl-helper/tdl-helper.exe
 release/
 
 # Local app data / test output

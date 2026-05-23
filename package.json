@@ -11,6 +11,7 @@
     "lint:rust": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "fetch:tdl": "node scripts/fetch-tdl.mjs",
+    "build:helper": "node scripts/build-helper.mjs",
     "release:collect": "node scripts/collect-release.mjs",
     "tauri": "tauri",
     "tauri:dev": "npm run fetch:tdl && tauri dev",

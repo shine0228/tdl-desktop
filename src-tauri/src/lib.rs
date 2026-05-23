@@ -27,6 +27,8 @@ pub fn run() {
             chat::list_chats,
             chat::export_chat_messages,
             chat::download_from_chat,
+            chat::preview_chat_media,
+            chat::cached_chat_media_preview,
             login::check_login_status,
             login::start_login,
             login::cancel_login,

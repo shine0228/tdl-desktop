@@ -8,6 +8,7 @@ TDL Desktop 是基于 Tauri + React 的 Telegram 下载客户端，底层调用 
 - 启动时优先使用内置 `tdl.exe`，用户主动更新后使用用户目录里的新版
 - Rust 后端统一管理下载进程，Windows 下隐藏子进程窗口
 - 支持链接下载、Telegram Desktop 导出的 JSON、原始 tdl 参数
+- 支持按对话浏览最近消息，识别图片、视频、音频和文件消息，并按需缓存图片/视频预览
 - 普通 `t.me/<频道>/<消息ID>` 链接粘贴后可自动读取消息文字预览
 - 支持 `--group`、扩展名过滤、续传、重启、跳过同名同大小、模板、takeout 等常用参数
 - 下载历史保存到 `~/.tdl-desktop/history.json`，失败信息会落盘

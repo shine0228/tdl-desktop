@@ -46,6 +46,7 @@ pub fn build_records(
             vec![request.raw_args.trim().to_string()]
         }
         SourceMode::Chat => return Err("对话模式请使用对话下载命令。".into()),
+        SourceMode::TgLite => return Err("TG Lite 模式请在 TG Lite 页面选择消息下载。".into()),
     };
 
     Ok(sources
@@ -78,6 +79,12 @@ pub fn build_download_args(request: &DownloadRequest) -> Result<Vec<String>, Str
             return Err("请输入 tdl 原始参数。".into());
         }
         return Ok(args);
+    }
+    if request.mode == SourceMode::Chat {
+        return Err("对话模式请使用对话下载命令。".into());
+    }
+    if request.mode == SourceMode::TgLite {
+        return Err("TG Lite 模式请在 TG Lite 页面选择消息下载。".into());
     }
 
     let directory = request.directory.trim();
@@ -118,6 +125,7 @@ pub fn build_download_args(request: &DownloadRequest) -> Result<Vec<String>, Str
         }
         SourceMode::Raw => unreachable!(),
         SourceMode::Chat => return Err("对话模式请使用对话下载命令。".into()),
+        SourceMode::TgLite => return Err("TG Lite 模式请在 TG Lite 页面选择消息下载。".into()),
     }
 
     if request.group {

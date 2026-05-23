@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertCircle,
@@ -7,13 +7,17 @@ import {
   CheckSquare2,
   ChevronDown,
   Download,
+  Eye,
+  File,
   FileJson,
   FolderOpen,
+  Image as ImageIcon,
   Link as LinkIcon,
   ListChecks,
   LogIn,
   LoaderCircle,
   MessageSquareText,
+  Music,
   Play,
   Search,
   QrCode,
@@ -24,6 +28,7 @@ import {
   Square,
   Terminal,
   Trash2,
+  Video,
   XCircle,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -32,6 +37,8 @@ import type {
   AppState,
   ChatDownloadRequest,
   ChatInfo,
+  ChatMediaPreview,
+  ChatMediaPreviewFile,
   DownloadEvent,
   DownloadFileProgress,
   DownloadRecord,
@@ -43,9 +50,13 @@ import type {
   LoginMethod,
   LoginStarted,
   LoginStatus,
+  MediaKind,
   LinkPreview,
   SourceMode,
   TdlInfo,
+  TgLiteChat,
+  TgLiteEvent,
+  TgLiteStatus,
 } from "./types";
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -54,6 +65,8 @@ const DEFAULT_CONFIG: AppConfig = {
   threads: 4,
   pool: 8,
   tdlOverridePath: null,
+  tgLiteApiId: "",
+  tgLiteApiHash: "",
 };
 
 const statusLabel: Record<DownloadStatus, string> = {
@@ -68,13 +81,32 @@ const modeLabel: Record<SourceMode, string> = {
   json: "JSON",
   raw: "原始参数",
   chat: "对话",
+  tgLite: "TG Lite",
 };
+
+const AUTO_PREVIEW_LIMIT = 4;
+const AUTO_PREVIEW_CONCURRENCY = 1;
+const AUTO_PREVIEW_MAX_PHOTO_BYTES = 20 * 1024 * 1024;
+const AUTO_PREVIEW_MAX_VIDEO_BYTES = 30 * 1024 * 1024;
 
 type PreviewState =
   | { status: "idle" }
   | { status: "loading"; link: string }
   | { status: "ready"; link: string; preview: LinkPreview }
   | { status: "error"; link: string; error: string };
+
+type MediaPreviewState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "ready"; preview: ChatMediaPreview }
+  | { status: "skipped"; reason: "tooLarge" | "videoTooLarge" | "unsupported" }
+  | { status: "error"; error: string };
+
+type QueuedPreview = {
+  chatId: string;
+  generation: number;
+  item: MessageInfo;
+};
 
 function inTauri() {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
@@ -111,6 +143,55 @@ function formatFileSize(value?: number | null) {
   return `${size >= 10 || unit === 0 ? Math.round(size) : size.toFixed(1)} ${units[unit]}`;
 }
 
+function mediaKindLabel(kind: MediaKind) {
+  const labels: Record<MediaKind, string> = {
+    none: "消息",
+    photo: "图片",
+    video: "视频",
+    audio: "音频",
+    document: "文件",
+    unknown: "媒体",
+  };
+  return labels[kind] ?? "媒体";
+}
+
+function canPreviewMedia(kind: MediaKind) {
+  return kind === "photo" || kind === "video";
+}
+
+function shouldAutoDownloadPreview(message: MessageInfo) {
+  if (!message.previewable || !canPreviewMedia(message.mediaKind)) return false;
+  if (message.mediaKind === "photo") {
+    return !message.fileSize || message.fileSize <= AUTO_PREVIEW_MAX_PHOTO_BYTES;
+  }
+  if (message.mediaKind === "video") {
+    return Boolean(message.fileSize && message.fileSize <= AUTO_PREVIEW_MAX_VIDEO_BYTES);
+  }
+  return false;
+}
+
+function skippedPreviewState(message: MessageInfo): MediaPreviewState {
+  if (message.mediaKind === "video") return { status: "skipped", reason: "videoTooLarge" };
+  if (message.mediaKind === "photo") return { status: "skipped", reason: "tooLarge" };
+  return { status: "skipped", reason: "unsupported" };
+}
+
+function mediaIcon(kind: MediaKind) {
+  if (kind === "photo") return ImageIcon;
+  if (kind === "video") return Video;
+  if (kind === "audio") return Music;
+  if (kind === "document") return File;
+  return MessageSquareText;
+}
+
+function previewButtonLabel(message: MessageInfo, state: MediaPreviewState) {
+  if (state.status === "loading") return "加载中";
+  if (message.mediaKind === "video") {
+    return state.status === "ready" ? "刷新预览" : "加载预览";
+  }
+  return state.status === "ready" ? "刷新缩略图" : "加载缩略图";
+}
+
 function loggedInLabel(status: LoginStatus) {
   if (status.username) return `已登录：@${status.username}`;
   if (status.displayName) return `已登录：${status.displayName}`;
@@ -139,6 +220,10 @@ function tdlSourceLabel(info: TdlInfo | null) {
 }
 
 function buildLocalPreview(request: DownloadRequest) {
+  if (request.mode === "tgLite") {
+    return "TG Lite 复用 tdl 登录态浏览消息，下载时交给 tdl";
+  }
+
   if (request.mode === "chat") {
     return "tdl chat export ... && tdl download -f <selected-messages.json>";
   }
@@ -236,12 +321,20 @@ function App() {
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [selectedMessageIds, setSelectedMessageIds] = useState<Set<number>>(new Set());
   const [messageCount, setMessageCount] = useState(50);
+  const [mediaPreviews, setMediaPreviews] = useState<Record<number, MediaPreviewState>>({});
   const [message, setMessage] = useState("正在加载");
   const [busy, setBusy] = useState(false);
 
   const configSaveTimer = useRef<number | null>(null);
   const pendingConfigRef = useRef<AppConfig | null>(null);
   const previewRequestSeq = useRef(0);
+  const selectedChatRef = useRef<ChatInfo | null>(null);
+  const mediaPreviewsRef = useRef<Record<number, MediaPreviewState>>({});
+  const previewQueueRef = useRef<QueuedPreview[]>([]);
+  const queuedPreviewIdsRef = useRef<Set<number>>(new Set());
+  const checkedPreviewCacheIdsRef = useRef<Set<number>>(new Set());
+  const previewRunningRef = useRef(0);
+  const previewGenerationRef = useRef(0);
 
   const flushConfig = useCallback(async () => {
     if (configSaveTimer.current !== null) {
@@ -288,6 +381,14 @@ function App() {
     },
     [flushConfig],
   );
+
+  useEffect(() => {
+    selectedChatRef.current = selectedChat;
+  }, [selectedChat]);
+
+  useEffect(() => {
+    mediaPreviewsRef.current = mediaPreviews;
+  }, [mediaPreviews]);
 
   useEffect(() => {
     void loadState();
@@ -593,6 +694,11 @@ function App() {
     setSelectedChat(chat);
     setMessages([]);
     setSelectedMessageIds(new Set());
+    setMediaPreviews({});
+    previewGenerationRef.current += 1;
+    previewQueueRef.current = [];
+    queuedPreviewIdsRef.current.clear();
+    checkedPreviewCacheIdsRef.current.clear();
     setMessagesLoading(true);
     setMessage(`正在读取 ${chat.name} 的最近 ${messageCount} 条消息`);
     try {
@@ -608,6 +714,137 @@ function App() {
       setMessagesLoading(false);
     }
   }
+
+  const loadMediaPreview = useCallback(async (item: MessageInfo, options?: { force?: boolean }) => {
+    const chat = selectedChatRef.current;
+    if (!inTauri() || !chat || !canPreviewMedia(item.mediaKind)) return;
+    const current = mediaPreviewsRef.current[item.id];
+    if (current?.status === "loading") return;
+    if (!options?.force && current && current.status !== "idle") return;
+
+    const generation = previewGenerationRef.current;
+    const chatId = String(chat.id);
+    setMediaPreviews((current) => ({ ...current, [item.id]: { status: "loading" } }));
+    try {
+      const preview = await invoke<ChatMediaPreview>("preview_chat_media", {
+        chatId,
+        messageId: item.id,
+      });
+      if (previewGenerationRef.current !== generation || String(selectedChatRef.current?.id) !== chatId) {
+        return;
+      }
+      setMediaPreviews((current) => ({
+        ...current,
+        [item.id]: { status: "ready", preview },
+      }));
+    } catch (error) {
+      if (previewGenerationRef.current !== generation || String(selectedChatRef.current?.id) !== chatId) {
+        return;
+      }
+      setMediaPreviews((current) => ({
+        ...current,
+        [item.id]: { status: "error", error: String(error) },
+      }));
+    }
+  }, []);
+
+  const loadCachedMediaPreview = useCallback(async (item: MessageInfo) => {
+    const chat = selectedChatRef.current;
+    if (!inTauri() || !chat || !canPreviewMedia(item.mediaKind)) return false;
+    const current = mediaPreviewsRef.current[item.id];
+    if (current?.status === "ready") return true;
+    if (current?.status === "loading") return true;
+    if (checkedPreviewCacheIdsRef.current.has(item.id)) return false;
+
+    const generation = previewGenerationRef.current;
+    const chatId = String(chat.id);
+    try {
+      const preview = await invoke<ChatMediaPreview | null>("cached_chat_media_preview", {
+        chatId,
+        messageId: item.id,
+      });
+      if (previewGenerationRef.current !== generation || String(selectedChatRef.current?.id) !== chatId) {
+        return false;
+      }
+      if (!preview || preview.files.length === 0) {
+        checkedPreviewCacheIdsRef.current.add(item.id);
+        return false;
+      }
+      setMediaPreviews((current) => ({
+        ...current,
+        [item.id]: { status: "ready", preview },
+      }));
+      return true;
+    } catch {
+      if (previewGenerationRef.current === generation && String(selectedChatRef.current?.id) === chatId) {
+        checkedPreviewCacheIdsRef.current.add(item.id);
+      }
+      return false;
+    }
+  }, []);
+
+  const loadAutoMediaPreview = useCallback(async (entry: QueuedPreview) => {
+    if (
+      previewGenerationRef.current !== entry.generation ||
+      String(selectedChatRef.current?.id) !== entry.chatId
+    ) {
+      return;
+    }
+
+    const cached = await loadCachedMediaPreview(entry.item);
+    if (cached) return;
+
+    if (!shouldAutoDownloadPreview(entry.item)) {
+      if (
+        previewGenerationRef.current === entry.generation &&
+        String(selectedChatRef.current?.id) === entry.chatId
+      ) {
+        setMediaPreviews((current) => ({
+          ...current,
+          [entry.item.id]: skippedPreviewState(entry.item),
+        }));
+      }
+      return;
+    }
+
+    await loadMediaPreview(entry.item);
+  }, [loadCachedMediaPreview, loadMediaPreview]);
+
+  const drainMediaPreviewQueue = useCallback(() => {
+    while (previewRunningRef.current < AUTO_PREVIEW_CONCURRENCY && previewQueueRef.current.length > 0) {
+      const next = previewQueueRef.current.shift();
+      if (!next) break;
+      queuedPreviewIdsRef.current.delete(next.item.id);
+      if (
+        previewGenerationRef.current !== next.generation ||
+        String(selectedChatRef.current?.id) !== next.chatId
+      ) {
+        continue;
+      }
+      previewRunningRef.current += 1;
+      void loadAutoMediaPreview(next).finally(() => {
+        previewRunningRef.current = Math.max(0, previewRunningRef.current - 1);
+        drainMediaPreviewQueue();
+      });
+    }
+  }, [loadAutoMediaPreview]);
+
+  const enqueueAutoMediaPreviews = useCallback((items: MessageInfo[]) => {
+    const chat = selectedChatRef.current;
+    if (!chat) return;
+    const chatId = String(chat.id);
+    const generation = previewGenerationRef.current;
+
+    for (const item of items) {
+      if (!canPreviewMedia(item.mediaKind) || !item.previewable) continue;
+      const current = mediaPreviewsRef.current[item.id];
+      if (current && current.status !== "idle") continue;
+      if (queuedPreviewIdsRef.current.has(item.id)) continue;
+      queuedPreviewIdsRef.current.add(item.id);
+      previewQueueRef.current.push({ chatId, generation, item });
+    }
+    drainMediaPreviewQueue();
+  }, [drainMediaPreviewQueue]);
 
   function toggleMessage(id: number) {
     setSelectedMessageIds((current) => {
@@ -630,6 +867,10 @@ function App() {
 
   async function startDownload() {
     if (runningTaskId) return;
+    if (mode === "tgLite") {
+      setMessage("TG Lite 下载入口会在对话浏览接入后启用");
+      return;
+    }
     if (!directory.trim() && mode !== "raw") {
       setMessage("请选择下载目录");
       return;
@@ -777,9 +1018,10 @@ function App() {
       : running
         ? "运行中"
         : "-";
+  const workspaceMode = mode === "chat" || mode === "tgLite";
 
   return (
-    <main className={`app-shell ${mode === "chat" ? "chat-shell" : ""}`}>
+    <main className={`app-shell ${workspaceMode ? "chat-shell" : ""}`}>
       <section className="workbench">
         <header className="topbar">
           <div>
@@ -829,6 +1071,7 @@ function App() {
             selectedChat={selectedChat}
             messages={messages}
             selectedMessageIds={selectedMessageIds}
+            mediaPreviews={mediaPreviews}
             chatSearch={chatSearch}
             messageCount={messageCount}
             loadingChats={chatLoading}
@@ -844,12 +1087,19 @@ function App() {
             onLoadChats={() => void loadChats()}
             onSelectChat={(chat) => void loadMessages(chat)}
             onRefreshMessages={() => selectedChat && void loadMessages(selectedChat)}
+            onAutoPreviewMessages={enqueueAutoMediaPreviews}
+            onPreviewMessage={(message) => void loadMediaPreview(message, { force: true })}
             onToggleMessage={toggleMessage}
             onToggleAll={toggleAllMessages}
             onPickDirectory={() => void pickDirectory()}
             onDirectoryChange={setDirectory}
             onStartDownload={() => void startDownload()}
             onCancelDownload={() => void cancelDownload()}
+          />
+        ) : mode === "tgLite" ? (
+          <TgLiteWorkspace
+            config={config}
+            onSaveConfig={(next) => void saveConfig(next)}
           />
         ) : (
         <div className="content-grid">
@@ -1059,7 +1309,7 @@ function App() {
         )}
       </section>
 
-      {mode !== "chat" ? (
+      {!workspaceMode ? (
         <section className="history-section">
           <div className="section-header">
             <h2>任务历史</h2>
@@ -1246,11 +1496,577 @@ function LoginPanel({
   );
 }
 
+function TgLiteWorkspace({
+  config,
+  onSaveConfig,
+}: {
+  config: AppConfig;
+  onSaveConfig: (config: AppConfig) => void;
+}) {
+  const [status, setStatus] = useState<TgLiteStatus | null>(null);
+  const [connectionState, setConnectionState] = useState("");
+  const [query, setQuery] = useState("");
+  const [chats, setChats] = useState<TgLiteChat[]>([]);
+  const [selectedChat, setSelectedChat] = useState<TgLiteChat | null>(null);
+  const [messages, setMessages] = useState<MessageInfo[]>([]);
+  const [messageCount, setMessageCount] = useState(50);
+  const [loadingStatus, setLoadingStatus] = useState(false);
+  const [loadingChats, setLoadingChats] = useState(false);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [apiId, setApiId] = useState(config.tgLiteApiId ?? "");
+  const [apiHash, setApiHash] = useState(config.tgLiteApiHash ?? "");
+  const [phoneNumber, setPhoneNumber] = useState("");
+  const [authCode, setAuthCode] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const selectedChatRef = useRef<TgLiteChat | null>(null);
+  const loadingChatsRef = useRef(false);
+
+  const effectiveStatus: TgLiteStatus =
+    status ?? {
+      configured: Boolean(config.tgLiteApiId?.trim() && config.tgLiteApiHash?.trim()),
+      initialized: false,
+      authorized: false,
+      state: "unknown",
+      message: "TG Lite 使用独立 TDLib 只读会话。",
+      qrLink: null,
+      username: null,
+      displayName: null,
+    };
+
+  const filteredChats = useMemo(() => {
+    const keyword = query.trim().toLowerCase();
+    const sorted = sortTgLiteChats(chats);
+    if (!keyword) return sorted;
+    return sorted.filter((chat) =>
+      [chat.title, chat.chatType, String(chat.id), chat.lastMessageText ?? ""]
+        .join(" ")
+        .toLowerCase()
+        .includes(keyword),
+    );
+  }, [chats, query]);
+
+  useEffect(() => {
+    setApiId(config.tgLiteApiId ?? "");
+    setApiHash(config.tgLiteApiHash ?? "");
+  }, [config.tgLiteApiHash, config.tgLiteApiId]);
+
+  useEffect(() => {
+    selectedChatRef.current = selectedChat;
+  }, [selectedChat]);
+
+  useEffect(() => {
+    loadingChatsRef.current = loadingChats;
+  }, [loadingChats]);
+
+  useEffect(() => {
+    if (!inTauri()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+
+    listen<TgLiteEvent>("tg-lite-event", (event) => {
+      if (!cancelled) {
+        handleTgLiteEvent(event.payload);
+      }
+    })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) setError(String(error));
+      });
+
+    void refreshStatus({ start: true });
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (status?.authorized && chats.length === 0 && !loadingChats) {
+      void loadTgLiteChats();
+    }
+  }, [chats.length, loadingChats, status?.authorized]);
+
+  function handleTgLiteEvent(event: TgLiteEvent) {
+    if (event.kind === "status") {
+      setStatus(event.status);
+      setError("");
+      return;
+    }
+
+    if (event.kind === "connection") {
+      setConnectionState(event.state);
+      return;
+    }
+
+    if (event.kind === "chatUpsert") {
+      setChats((current) => upsertTgLiteChat(current, event.chat));
+      setSelectedChat((current) => current?.id === event.chat.id ? { ...current, ...event.chat } : current);
+      return;
+    }
+
+    if (event.kind === "chatDelete") {
+      setChats((current) => current.filter((chat) => chat.id !== event.chatId));
+      setSelectedChat((current) => current?.id === event.chatId ? null : current);
+      return;
+    }
+
+    if (event.kind === "messageNew") {
+      setChats((current) => current.map((chat) => chat.id === event.chatId ? {
+        ...chat,
+        lastMessageId: event.message.id,
+        lastMessageText: event.message.text ?? chat.lastMessageText,
+      } : chat));
+      if (selectedChatRef.current?.id === event.chatId) {
+        setMessages((current) => sortMessages(upsertMessage(current, event.message)));
+      }
+      return;
+    }
+
+    if (event.kind === "messageUpdate") {
+      if (selectedChatRef.current?.id === event.chatId && event.message) {
+        setMessages((current) => sortMessages(upsertMessage(current, event.message!)));
+      }
+      return;
+    }
+
+    if (event.kind === "messageDelete" && selectedChatRef.current?.id === event.chatId) {
+      const deleted = new Set(event.messageIds);
+      setMessages((current) => current.filter((message) => !deleted.has(message.id)));
+    }
+  }
+
+  async function refreshStatus(options?: { start?: boolean }) {
+    if (!inTauri()) return;
+    setLoadingStatus(true);
+    setError("");
+    try {
+      const next = options?.start
+        ? await invoke<TgLiteStatus>("tg_lite_start")
+        : await invoke<TgLiteStatus>("tg_lite_status");
+      setStatus(next);
+    } catch (error) {
+      setError(String(error));
+      try {
+        setStatus(await invoke<TgLiteStatus>("tg_lite_status"));
+      } catch {
+        // keep the original error visible
+      }
+    } finally {
+      setLoadingStatus(false);
+    }
+  }
+
+  async function saveTgLiteConfig() {
+    const next = { ...config, tgLiteApiId: apiId.trim(), tgLiteApiHash: apiHash.trim() };
+    onSaveConfig(next);
+    setStatus((current) => current ? { ...current, configured: Boolean(next.tgLiteApiId && next.tgLiteApiHash) } : current);
+    window.setTimeout(() => void refreshStatus({ start: true }), 150);
+  }
+
+  async function requestQrLogin() {
+    setLoadingStatus(true);
+    setError("");
+    try {
+      setStatus(await invoke<TgLiteStatus>("tg_lite_request_qr"));
+    } catch (error) {
+      setError(String(error));
+    } finally {
+      setLoadingStatus(false);
+    }
+  }
+
+  async function submitPhone() {
+    if (!phoneNumber.trim()) return;
+    setLoadingStatus(true);
+    setError("");
+    try {
+      setStatus(await invoke<TgLiteStatus>("tg_lite_set_phone", { phoneNumber: phoneNumber.trim() }));
+    } catch (error) {
+      setError(String(error));
+    } finally {
+      setLoadingStatus(false);
+    }
+  }
+
+  async function submitCode() {
+    if (!authCode.trim()) return;
+    setLoadingStatus(true);
+    setError("");
+    try {
+      setStatus(await invoke<TgLiteStatus>("tg_lite_check_code", { code: authCode.trim() }));
+      setAuthCode("");
+    } catch (error) {
+      setError(String(error));
+    } finally {
+      setLoadingStatus(false);
+    }
+  }
+
+  async function submitPassword() {
+    if (!password) return;
+    setLoadingStatus(true);
+    setError("");
+    try {
+      setStatus(await invoke<TgLiteStatus>("tg_lite_check_password", { password }));
+      setPassword("");
+    } catch (error) {
+      setError(String(error));
+    } finally {
+      setLoadingStatus(false);
+    }
+  }
+
+  async function loadTgLiteChats() {
+    if (!inTauri() || loadingChatsRef.current) return;
+    loadingChatsRef.current = true;
+    setLoadingChats(true);
+    setError("");
+    try {
+      const list = await invoke<TgLiteChat[]>("tg_lite_load_chats", { limit: 100 });
+      setChats(sortTgLiteChats(list));
+      if (list.length && !selectedChatRef.current) {
+        await selectTgLiteChat(sortTgLiteChats(list)[0]);
+      }
+    } catch (error) {
+      setError(String(error));
+      await refreshStatus();
+    } finally {
+      loadingChatsRef.current = false;
+      setLoadingChats(false);
+    }
+  }
+
+  async function selectTgLiteChat(chat: TgLiteChat) {
+    setSelectedChat(chat);
+    setMessages([]);
+    if (!inTauri()) return;
+    setLoadingMessages(true);
+    setError("");
+    try {
+      const list = await invoke<MessageInfo[]>("tg_lite_load_messages", {
+        chatId: chat.id,
+        limit: messageCount,
+      });
+      setMessages(sortMessages(list));
+    } catch (error) {
+      setError(String(error));
+      await refreshStatus();
+    } finally {
+      setLoadingMessages(false);
+    }
+  }
+
+  async function refreshTgLiteMessages() {
+    if (selectedChat) {
+      await selectTgLiteChat(selectedChat);
+    }
+  }
+
+  const statusReady = effectiveStatus.authorized;
+  const accountLabel = effectiveStatus.username
+    ? `@${effectiveStatus.username}`
+    : effectiveStatus.displayName || effectiveStatus.message;
+  const needsBootstrap = !statusReady;
+
+  return (
+    <div className="tg-lite-workspace">
+      <aside className="tg-lite-dialogs">
+        <div className="tg-lite-sidebar-head">
+            <div>
+              <strong>TG Lite</strong>
+              <span>{statusReady ? accountLabel : effectiveStatus.message}</span>
+            </div>
+            <div className="tg-lite-sidebar-actions">
+              <button className="icon-button compact-icon" type="button" onClick={() => void refreshStatus({ start: !statusReady })} disabled={loadingStatus} title="刷新状态">
+                {loadingStatus ? <LoaderCircle size={17} /> : statusReady ? <ShieldCheck size={17} /> : <AlertCircle size={17} />}
+              </button>
+              <button className="icon-button compact-icon" type="button" onClick={loadTgLiteChats} disabled={!statusReady || loadingChats} title="刷新对话">
+                {loadingChats ? <LoaderCircle size={17} /> : <RefreshCcw size={17} />}
+              </button>
+            </div>
+          </div>
+
+          {error ? <p className="tg-lite-sidebar-error">{error}</p> : null}
+
+          <div className="telegram-search">
+            <Search size={16} />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索对话或消息预览" disabled={!statusReady} />
+          </div>
+
+          <div className="tg-lite-dialog-list">
+            {!statusReady ? (
+              <div className="telegram-empty">完成一次 TDLib 只读连接后，对话会在这里实时更新。</div>
+            ) : loadingChats ? (
+              <div className="telegram-empty">
+                <LoaderCircle size={18} />
+                正在加载对话
+              </div>
+            ) : filteredChats.length ? (
+              filteredChats.map((chat) => (
+                <button
+                  className={`telegram-chat-item tg-lite-dialog-item ${selectedChat?.id === chat.id ? "active" : ""}`}
+                  key={chat.id}
+                  onClick={() => void selectTgLiteChat(chat)}
+                  disabled={loadingMessages}
+                >
+                  <div className="chat-avatar">{chat.title.trim().slice(0, 1).toUpperCase() || "T"}</div>
+                  <div className="telegram-chat-main">
+                    <div className="tg-lite-dialog-title">
+                      <strong>{chat.title}</strong>
+                      {chat.unreadCount ? <span className="tg-lite-unread-badge">{chat.unreadCount}</span> : null}
+                    </div>
+                    <span className="tg-lite-dialog-preview">{chat.lastMessageText?.trim() || `${chat.chatType} · ${chat.id}`}</span>
+                  </div>
+                </button>
+              ))
+            ) : (
+              <div className="telegram-empty">没有可显示的对话</div>
+            )}
+          </div>
+        </aside>
+
+        <section className="tg-lite-messages">
+          <header className="tg-lite-message-header">
+            <div className="telegram-title">
+              <div className="chat-avatar large">{selectedChat?.title.trim().slice(0, 1).toUpperCase() || "T"}</div>
+              <div>
+                <strong>{selectedChat?.title ?? "TG Lite 只读浏览器"}</strong>
+                <span>
+                  {selectedChat
+                    ? `${messages.length} 条消息 · ${selectedChat.chatType}`
+                    : statusReady ? `实时接收中${connectionState ? ` · ${connectionState}` : ""}` : effectiveStatus.message}
+                </span>
+              </div>
+            </div>
+            <div className="telegram-actions tg-lite-reader-actions">
+              <select
+                value={messageCount}
+                onChange={(event) => setMessageCount(Number(event.target.value))}
+                disabled={loadingMessages || !statusReady}
+              >
+                <option value={50}>最近 50</option>
+                <option value={100}>最近 100</option>
+                <option value={200}>最近 200</option>
+              </select>
+              <button className="ghost-button" onClick={() => void refreshTgLiteMessages()} disabled={!selectedChat || loadingMessages}>
+                {loadingMessages ? <LoaderCircle size={16} /> : <RefreshCcw size={16} />}
+                刷新
+              </button>
+            </div>
+          </header>
+
+          <div className="tg-lite-message-list">
+            {needsBootstrap ? (
+              <TgLiteBootstrap
+                status={effectiveStatus}
+                loading={loadingStatus}
+                apiId={apiId}
+                apiHash={apiHash}
+                phoneNumber={phoneNumber}
+                authCode={authCode}
+                password={password}
+                onApiIdChange={setApiId}
+                onApiHashChange={setApiHash}
+                onPhoneNumberChange={setPhoneNumber}
+                onAuthCodeChange={setAuthCode}
+                onPasswordChange={setPassword}
+                onSaveConfig={() => void saveTgLiteConfig()}
+                onRequestQr={() => void requestQrLogin()}
+                onSubmitPhone={() => void submitPhone()}
+                onSubmitCode={() => void submitCode()}
+                onSubmitPassword={() => void submitPassword()}
+              />
+            ) : !selectedChat ? (
+              <div className="tg-lite-locked">
+                <MessageSquareText size={38} />
+                <strong>选择一个对话开始浏览</strong>
+                <span>这里是只读阅读模式，没有发送框，也不会提供账号管理功能。</span>
+              </div>
+            ) : loadingMessages ? (
+              <div className="tg-lite-locked">
+                <LoaderCircle size={34} />
+                <strong>正在读取消息</strong>
+                <span>正在读取最近 {messageCount} 条消息。</span>
+              </div>
+            ) : messages.length ? (
+              messages.map((item) => <TgLiteMessageBubble key={item.id} message={item} />)
+            ) : (
+              <div className="tg-lite-locked">
+                <MessageSquareText size={38} />
+                <strong>没有可显示的消息</strong>
+                <span>可以刷新消息或增加最近消息数量。</span>
+              </div>
+            )}
+          </div>
+        </section>
+    </div>
+  );
+}
+
+function sortTgLiteChats(items: TgLiteChat[]) {
+  return [...items].sort((left, right) => {
+    const leftOrder = left.order ? BigInt(left.order) : 0n;
+    const rightOrder = right.order ? BigInt(right.order) : 0n;
+    if (leftOrder !== rightOrder) return rightOrder > leftOrder ? 1 : -1;
+    return right.id - left.id;
+  });
+}
+
+function upsertTgLiteChat(items: TgLiteChat[], chat: TgLiteChat) {
+  const index = items.findIndex((item) => item.id === chat.id);
+  const next = index === -1
+    ? [...items, chat]
+    : items.map((item, itemIndex) => itemIndex === index ? { ...item, ...chat } : item);
+  return sortTgLiteChats(next);
+}
+
+function sortMessages(items: MessageInfo[]) {
+  return [...items].sort((left, right) => left.id - right.id);
+}
+
+function upsertMessage(items: MessageInfo[], message: MessageInfo) {
+  const index = items.findIndex((item) => item.id === message.id);
+  if (index === -1) return [...items, message];
+  return items.map((item, itemIndex) => itemIndex === index ? { ...item, ...message } : item);
+}
+
+function TgLiteBootstrap({
+  status,
+  loading,
+  apiId,
+  apiHash,
+  phoneNumber,
+  authCode,
+  password,
+  onApiIdChange,
+  onApiHashChange,
+  onPhoneNumberChange,
+  onAuthCodeChange,
+  onPasswordChange,
+  onSaveConfig,
+  onRequestQr,
+  onSubmitPhone,
+  onSubmitCode,
+  onSubmitPassword,
+}: {
+  status: TgLiteStatus;
+  loading: boolean;
+  apiId: string;
+  apiHash: string;
+  phoneNumber: string;
+  authCode: string;
+  password: string;
+  onApiIdChange: (value: string) => void;
+  onApiHashChange: (value: string) => void;
+  onPhoneNumberChange: (value: string) => void;
+  onAuthCodeChange: (value: string) => void;
+  onPasswordChange: (value: string) => void;
+  onSaveConfig: () => void;
+  onRequestQr: () => void;
+  onSubmitPhone: () => void;
+  onSubmitCode: () => void;
+  onSubmitPassword: () => void;
+}) {
+  return (
+    <div className="tg-lite-bootstrap">
+      <ShieldCheck size={42} />
+      <strong>连接 TG Lite 只读会话</strong>
+      <span>{status.message}</span>
+
+      {!status.configured ? (
+        <div className="tg-lite-bootstrap-card">
+          <label className="field compact">
+            <span>api_id</span>
+            <input value={apiId} onChange={(event) => onApiIdChange(event.target.value)} placeholder="Telegram API ID" />
+          </label>
+          <label className="field compact">
+            <span>api_hash</span>
+            <input value={apiHash} onChange={(event) => onApiHashChange(event.target.value)} placeholder="Telegram API Hash" />
+          </label>
+          <button className="primary-button" onClick={onSaveConfig} disabled={loading || !apiId.trim() || !apiHash.trim()}>
+            {loading ? <LoaderCircle size={16} /> : <ShieldCheck size={16} />}
+            保存并连接
+          </button>
+        </div>
+      ) : (
+        <div className="tg-lite-bootstrap-card">
+          {status.qrLink ? <code className="tg-lite-qr-code">{status.qrLink}</code> : null}
+          <button className="primary-button" onClick={onRequestQr} disabled={loading}>
+            {loading ? <LoaderCircle size={16} /> : <QrCode size={16} />}
+            获取 QR 登录链接
+          </button>
+          {status.state === "waitPhoneNumber" || status.state === "notStarted" || status.state === "initializing" ? (
+            <div className="tg-lite-auth-row">
+              <input value={phoneNumber} onChange={(event) => onPhoneNumberChange(event.target.value)} placeholder="手机号，例如 +8613800000000" />
+              <button className="ghost-button" onClick={onSubmitPhone} disabled={loading || !phoneNumber.trim()}>提交手机号</button>
+            </div>
+          ) : null}
+          {status.state === "waitCode" ? (
+            <div className="tg-lite-auth-row">
+              <input value={authCode} onChange={(event) => onAuthCodeChange(event.target.value)} placeholder="验证码" />
+              <button className="ghost-button" onClick={onSubmitCode} disabled={loading || !authCode.trim()}>提交验证码</button>
+            </div>
+          ) : null}
+          {status.state === "waitPassword" ? (
+            <div className="tg-lite-auth-row">
+              <input type="password" value={password} onChange={(event) => onPasswordChange(event.target.value)} placeholder="二步验证密码" />
+              <button className="ghost-button" onClick={onSubmitPassword} disabled={loading || !password}>提交密码</button>
+            </div>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TgLiteMessageBubble({
+  message,
+}: {
+  message: MessageInfo;
+}) {
+  const Icon = mediaIcon(message.mediaKind);
+  const hasText = Boolean(message.text?.trim());
+  const mediaLabel = message.fileName || message.mediaType || `${mediaKindLabel(message.mediaKind)}消息`;
+
+  return (
+    <article className="tg-lite-message-bubble">
+      <div className="tg-lite-message-body">
+        {message.mediaKind !== "none" ? (
+          <div className="tg-lite-media-pill">
+            <Icon size={16} />
+            <span>{mediaLabel}</span>
+            {message.fileSize ? <em>{formatFileSize(message.fileSize)}</em> : null}
+          </div>
+        ) : null}
+        <p className={!hasText ? "muted" : ""}>
+          {hasText ? message.text : message.mediaKind !== "none" ? `${mediaKindLabel(message.mediaKind)}消息` : "无文字内容"}
+        </p>
+        <div className="tg-lite-message-meta">
+          <span>{formatDate(message.date)}</span>
+          <span>#{message.id}</span>
+          {message.mimeType ? <span>{message.mimeType}</span> : null}
+          {message.width && message.height ? <span>{message.width}x{message.height}</span> : null}
+          {message.duration ? <span>{Math.round(message.duration)}s</span> : null}
+        </div>
+      </div>
+    </article>
+  );
+}
+
 function TelegramWorkspace({
   chats,
   selectedChat,
   messages,
   selectedMessageIds,
+  mediaPreviews,
   chatSearch,
   messageCount,
   loadingChats,
@@ -1266,6 +2082,8 @@ function TelegramWorkspace({
   onLoadChats,
   onSelectChat,
   onRefreshMessages,
+  onAutoPreviewMessages,
+  onPreviewMessage,
   onToggleMessage,
   onToggleAll,
   onPickDirectory,
@@ -1277,6 +2095,7 @@ function TelegramWorkspace({
   selectedChat: ChatInfo | null;
   messages: MessageInfo[];
   selectedMessageIds: Set<number>;
+  mediaPreviews: Record<number, MediaPreviewState>;
   chatSearch: string;
   messageCount: number;
   loadingChats: boolean;
@@ -1292,6 +2111,8 @@ function TelegramWorkspace({
   onLoadChats: () => void;
   onSelectChat: (chat: ChatInfo) => void;
   onRefreshMessages: () => void;
+  onAutoPreviewMessages: (messages: MessageInfo[]) => void;
+  onPreviewMessage: (message: MessageInfo) => void;
   onToggleMessage: (id: number) => void;
   onToggleAll: () => void;
   onPickDirectory: () => void;
@@ -1301,6 +2122,72 @@ function TelegramWorkspace({
 }) {
   const selectedCount = selectedMessageIds.size;
   const allSelected = messages.length > 0 && selectedCount === messages.length;
+  const messageListRef = useRef<HTMLDivElement | null>(null);
+  const messageNodeRefs = useRef<Map<number, HTMLElement>>(new Map());
+  const [visibleMessageIds, setVisibleMessageIds] = useState<Set<number>>(new Set());
+
+  const registerMessageNode = useCallback((id: number, node: HTMLElement | null) => {
+    if (node) {
+      messageNodeRefs.current.set(id, node);
+    } else {
+      messageNodeRefs.current.delete(id);
+    }
+  }, []);
+
+  useEffect(() => {
+    setVisibleMessageIds(new Set());
+  }, [selectedChat?.id, messages]);
+
+  useEffect(() => {
+    const root = messageListRef.current;
+    if (!root || !messages.length || typeof IntersectionObserver === "undefined") return;
+
+    const validIds = new Set(messages.map((item) => item.id));
+    for (const id of Array.from(messageNodeRefs.current.keys())) {
+      if (!validIds.has(id)) messageNodeRefs.current.delete(id);
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        setVisibleMessageIds((current) => {
+          const next = new Set(current);
+          let changed = false;
+          for (const entry of entries) {
+            const id = Number((entry.target as HTMLElement).dataset.messageId);
+            if (!Number.isFinite(id)) continue;
+            if (entry.isIntersecting) {
+              if (!next.has(id)) {
+                next.add(id);
+                changed = true;
+              }
+            } else if (next.delete(id)) {
+              changed = true;
+            }
+          }
+          return changed ? next : current;
+        });
+      },
+      { root, rootMargin: "120px 0px", threshold: 0.15 },
+    );
+
+    messageNodeRefs.current.forEach((node) => observer.observe(node));
+    return () => observer.disconnect();
+  }, [messages]);
+
+  useEffect(() => {
+    const visibleMedia = messages
+      .filter((item) => visibleMessageIds.has(item.id) && item.previewable && item.mediaKind !== "none")
+      .sort((left, right) => {
+        const leftKind = left.mediaKind === "photo" ? 0 : left.mediaKind === "video" ? 1 : 2;
+        const rightKind = right.mediaKind === "photo" ? 0 : right.mediaKind === "video" ? 1 : 2;
+        if (leftKind !== rightKind) return leftKind - rightKind;
+        return (left.fileSize ?? 0) - (right.fileSize ?? 0);
+      })
+      .slice(0, AUTO_PREVIEW_LIMIT);
+    if (visibleMedia.length > 0) {
+      onAutoPreviewMessages(visibleMedia);
+    }
+  }, [messages, onAutoPreviewMessages, visibleMessageIds]);
 
   return (
     <div className="telegram-workspace">
@@ -1401,7 +2288,7 @@ function TelegramWorkspace({
           </div>
         </div>
 
-        <div className="telegram-messages">
+        <div className="telegram-messages" ref={messageListRef}>
           {!selectedChat ? (
             <div className="telegram-hero">
               <Bot size={42} />
@@ -1420,7 +2307,10 @@ function TelegramWorkspace({
                 key={item.id}
                 message={item}
                 selected={selectedMessageIds.has(item.id)}
+                previewState={mediaPreviews[item.id] ?? { status: "idle" }}
+                nodeRef={(node) => registerMessageNode(item.id, node)}
                 onToggle={() => onToggleMessage(item.id)}
+                onPreview={() => onPreviewMessage(item)}
               />
             ))
           ) : (
@@ -1439,29 +2329,140 @@ function TelegramWorkspace({
 function MessageBubble({
   message,
   selected,
+  previewState,
+  nodeRef,
   onToggle,
+  onPreview,
 }: {
   message: MessageInfo;
   selected: boolean;
+  previewState: MediaPreviewState;
+  nodeRef: (node: HTMLElement | null) => void;
   onToggle: () => void;
+  onPreview: () => void;
 }) {
-  const title = message.fileName || message.mediaType || (message.fileSize ? "媒体消息" : "消息");
+  const Icon = mediaIcon(message.mediaKind);
+  const title =
+    message.fileName ||
+    message.mediaType ||
+    (message.mediaKind !== "none" ? `${mediaKindLabel(message.mediaKind)}消息` : "消息");
   return (
-    <label className={`message-bubble ${selected ? "selected" : ""}`}>
-      <input type="checkbox" checked={selected} onChange={onToggle} />
+    <article
+      className={`message-bubble ${selected ? "selected" : ""}`}
+      data-message-id={message.id}
+      ref={nodeRef}
+    >
+      <label className="message-check">
+        <input type="checkbox" checked={selected} onChange={onToggle} />
+      </label>
       <div className="message-bubble-body">
         <div className="message-bubble-top">
-          <strong>{title}</strong>
+          <strong>
+            <Icon size={16} />
+            {title}
+          </strong>
           <span>#{message.id}</span>
         </div>
-        <p>{message.text || "无文字内容"}</p>
+        <MediaPreview state={previewState} message={message} />
+        <p>{message.text || (message.mediaKind !== "none" ? `${mediaKindLabel(message.mediaKind)}消息` : "无文字内容")}</p>
         <div className="message-bubble-meta">
           <span>{formatDate(message.date)}</span>
           {message.fileSize ? <span>{formatFileSize(message.fileSize)}</span> : null}
+          {message.mimeType ? <span>{message.mimeType}</span> : null}
           {message.mediaType ? <span>{message.mediaType}</span> : null}
+          {message.width && message.height ? <span>{message.width}x{message.height}</span> : null}
+          {message.duration ? <span>{Math.round(message.duration)}s</span> : null}
+        </div>
+        {message.previewable ? (
+          <button
+            className="preview-button"
+            type="button"
+            onClick={onPreview}
+            disabled={previewState.status === "loading"}
+          >
+            {previewState.status === "loading" ? <LoaderCircle size={15} /> : <Eye size={15} />}
+            {previewButtonLabel(message, previewState)}
+          </button>
+        ) : null}
+        {previewState.status === "error" ? <div className="preview-error">{previewState.error}</div> : null}
+      </div>
+    </article>
+  );
+}
+
+function MediaPreview({ state, message }: { state: MediaPreviewState; message: MessageInfo }) {
+  if (state.status !== "ready" || state.preview.files.length === 0) {
+    if (message.mediaKind === "none") return null;
+    return <MediaPlaceholder message={message} state={state} />;
+  }
+
+  return (
+    <div className="media-preview-grid">
+      {state.preview.files.map((file) => (
+        <MediaPreviewFile key={file.path} file={file} messageId={message.id} />
+      ))}
+    </div>
+  );
+}
+
+function MediaPlaceholder({ message, state }: { message: MessageInfo; state: MediaPreviewState }) {
+  const Icon = mediaIcon(message.mediaKind);
+  const name = message.fileName || `${mediaKindLabel(message.mediaKind)}消息`;
+  const text =
+    state.status === "loading"
+      ? "正在加载缩略图"
+      : state.status === "skipped"
+        ? message.mediaKind === "video"
+          ? "视频较大，点击加载预览"
+          : "文件较大，点击加载缩略图"
+        : canPreviewMedia(message.mediaKind)
+          ? "进入可见区域后自动加载"
+          : "媒体文件";
+
+  return (
+    <div className="media-preview-grid">
+      <div className={`media-thumb-card media-thumb-placeholder media-thumb-${message.mediaKind}`}>
+        <div className="media-thumb-visual">
+          <Icon size={28} />
+          {state.status === "loading" ? <LoaderCircle className="media-thumb-loader" size={18} /> : null}
+        </div>
+        <div className="media-thumb-info">
+          <strong>#{message.id}</strong>
+          <span>{name}</span>
+          <em>{text}</em>
         </div>
       </div>
-    </label>
+    </div>
+  );
+}
+
+function MediaPreviewFile({ file, messageId }: { file: ChatMediaPreviewFile; messageId: number }) {
+  const source = convertFileSrc(file.path);
+  const Icon = mediaIcon(file.mediaKind);
+  const title = `#${messageId} ${file.fileName}`;
+
+  return (
+    <div className={`media-thumb-card media-thumb-${file.mediaKind}`} title={title}>
+      <div className="media-thumb-visual">
+        {file.mediaKind === "photo" ? (
+          <img src={source} alt={title} loading="lazy" draggable={false} />
+        ) : file.mediaKind === "video" ? (
+          <>
+            <video src={source} muted playsInline preload="metadata" />
+            <span className="media-thumb-overlay">
+              <Video size={16} />
+            </span>
+          </>
+        ) : (
+          <Icon size={24} />
+        )}
+      </div>
+      <div className="media-thumb-info">
+        <strong>#{messageId}</strong>
+        <span>{file.fileName}</span>
+        {file.size ? <em>{formatFileSize(file.size)}</em> : null}
+      </div>
+    </div>
   );
 }
 
