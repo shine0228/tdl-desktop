@@ -5,7 +5,7 @@ use std::{
     process::Child,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -19,6 +19,8 @@ use crate::{
     },
     util::{parse_progress, strip_ansi, write_json},
 };
+
+const OUTPUT_THROTTLE_INTERVAL: Duration = Duration::from_millis(180);
 
 pub fn build_records(
     state: &AppState,
@@ -46,7 +48,6 @@ pub fn build_records(
             vec![request.raw_args.trim().to_string()]
         }
         SourceMode::Chat => return Err("对话模式请使用对话下载命令。".into()),
-        SourceMode::TgLite => return Err("TG Lite 模式请在 TG Lite 页面选择消息下载。".into()),
     };
 
     Ok(sources
@@ -82,9 +83,6 @@ pub fn build_download_args(request: &DownloadRequest) -> Result<Vec<String>, Str
     }
     if request.mode == SourceMode::Chat {
         return Err("对话模式请使用对话下载命令。".into());
-    }
-    if request.mode == SourceMode::TgLite {
-        return Err("TG Lite 模式请在 TG Lite 页面选择消息下载。".into());
     }
 
     let directory = request.directory.trim();
@@ -125,7 +123,6 @@ pub fn build_download_args(request: &DownloadRequest) -> Result<Vec<String>, Str
         }
         SourceMode::Raw => unreachable!(),
         SourceMode::Chat => return Err("对话模式请使用对话下载命令。".into()),
-        SourceMode::TgLite => return Err("TG Lite 模式请在 TG Lite 页面选择消息下载。".into()),
     }
 
     if request.group {
@@ -207,13 +204,20 @@ where
     thread::spawn(move || {
         let mut reader = BufReader::new(stream);
         let mut pending = Vec::with_capacity(512);
+        let mut throttle = OutputThrottle::default();
 
         loop {
             let buf = match reader.fill_buf() {
                 Ok(slice) if slice.is_empty() => break,
                 Ok(slice) => slice,
                 Err(error) => {
-                    emit_line(&app, &task_id, format!("读取 tdl 输出失败: {error}"), None);
+                    emit_line(
+                        &app,
+                        &task_id,
+                        format!("读取 tdl 输出失败: {error}"),
+                        None,
+                        None,
+                    );
                     break;
                 }
             };
@@ -221,7 +225,7 @@ where
             let consumed = buf.len();
             for &byte in buf {
                 match byte {
-                    b'\n' | b'\r' => flush_line(&app, &task_id, &mut pending),
+                    b'\n' | b'\r' => flush_line(&app, &task_id, &mut pending, &mut throttle),
                     _ => pending.push(byte),
                 }
             }
@@ -230,12 +234,27 @@ where
 
         // 进程结束时把残留输出也吐出去,避免最后一行被吞。
         if !pending.is_empty() {
-            flush_line(&app, &task_id, &mut pending);
+            flush_line_inner(&app, &task_id, &mut pending, &mut throttle, true);
         }
     });
 }
 
-fn flush_line(app: &AppHandle, task_id: &str, pending: &mut Vec<u8>) {
+fn flush_line(
+    app: &AppHandle,
+    task_id: &str,
+    pending: &mut Vec<u8>,
+    throttle: &mut OutputThrottle,
+) {
+    flush_line_inner(app, task_id, pending, throttle, false);
+}
+
+fn flush_line_inner(
+    app: &AppHandle,
+    task_id: &str,
+    pending: &mut Vec<u8>,
+    throttle: &mut OutputThrottle,
+    force: bool,
+) {
     if pending.is_empty() {
         return;
     }
@@ -248,11 +267,69 @@ fn flush_line(app: &AppHandle, task_id: &str, pending: &mut Vec<u8>) {
     }
 
     let progress = parse_progress(&line);
-    emit_line(app, task_id, line, progress);
+    let file_progress = parse_file_progress(&line);
+    if throttle.should_emit(progress, file_progress.as_ref(), force) {
+        emit_line(app, task_id, line, progress, file_progress);
+    }
 }
 
-fn emit_line(app: &AppHandle, task_id: &str, line: String, progress: Option<f64>) {
-    let file_progress = parse_file_progress(&line);
+#[derive(Debug)]
+struct OutputThrottle {
+    last_emit: Instant,
+    emitted_any_progress: bool,
+}
+
+impl Default for OutputThrottle {
+    fn default() -> Self {
+        Self {
+            last_emit: Instant::now() - OUTPUT_THROTTLE_INTERVAL,
+            emitted_any_progress: false,
+        }
+    }
+}
+
+impl OutputThrottle {
+    fn should_emit(
+        &mut self,
+        progress: Option<f64>,
+        file_progress: Option<&DownloadFileProgress>,
+        force: bool,
+    ) -> bool {
+        if force {
+            self.record_emit(progress, file_progress);
+            return true;
+        }
+        if progress.is_none() && file_progress.is_none() {
+            return true;
+        }
+        let done = progress.is_some_and(|value| value >= 99.9)
+            || file_progress.is_some_and(|value| value.done || value.progress >= 99.9);
+        let now = Instant::now();
+        if !self.emitted_any_progress
+            || done
+            || now.duration_since(self.last_emit) >= OUTPUT_THROTTLE_INTERVAL
+        {
+            self.record_emit(progress, file_progress);
+            return true;
+        }
+        false
+    }
+
+    fn record_emit(&mut self, progress: Option<f64>, file_progress: Option<&DownloadFileProgress>) {
+        if progress.is_some() || file_progress.is_some() {
+            self.emitted_any_progress = true;
+            self.last_emit = Instant::now();
+        }
+    }
+}
+
+fn emit_line(
+    app: &AppHandle,
+    task_id: &str,
+    line: String,
+    progress: Option<f64>,
+    file_progress: Option<DownloadFileProgress>,
+) {
     let _ = app.emit(
         "download-event",
         DownloadEvent {
@@ -293,7 +370,10 @@ pub fn spawn_process_monitor_with_cleanup(
             let status = {
                 let mut child = match child.lock() {
                     Ok(child) => child,
-                    Err(_) => break None,
+                    Err(_) => {
+                        eprintln!("[download] child process lock poisoned for task {task_id}");
+                        break None;
+                    }
                 };
                 child.try_wait()
             };
@@ -305,14 +385,19 @@ pub fn spawn_process_monitor_with_cleanup(
             }
         };
 
-        let cancelled = state
-            .cancelled
-            .lock()
-            .map(|mut cancelled| cancelled.remove(&task_id))
-            .unwrap_or(false);
+        let cancelled = match state.cancelled.lock() {
+            Ok(mut cancelled) => cancelled.remove(&task_id),
+            Err(_) => {
+                eprintln!("[download] cancelled-state lock poisoned for task {task_id}");
+                false
+            }
+        };
 
-        if let Ok(mut running) = state.running.lock() {
-            running.remove(&task_id);
+        match state.running.lock() {
+            Ok(mut running) => {
+                running.remove(&task_id);
+            }
+            Err(_) => eprintln!("[download] running-state lock poisoned for task {task_id}"),
         }
         if let Some(path) = cleanup_file {
             let _ = fs::remove_file(path);
@@ -334,15 +419,20 @@ pub fn spawn_process_monitor_with_cleanup(
         };
 
         let completed_at = Utc::now().to_rfc3339();
-        if let Ok(mut history) = state.history.lock() {
-            for record in history.iter_mut() {
-                if record_ids.contains(&record.id) {
-                    record.status = status;
-                    record.completed_at = Some(completed_at.clone());
-                    record.error = error.clone();
+        match state.history.lock() {
+            Ok(mut history) => {
+                for record in history.iter_mut() {
+                    if record_ids.contains(&record.id) {
+                        record.status = status;
+                        record.completed_at = Some(completed_at.clone());
+                        record.error = error.clone();
+                    }
+                }
+                if let Err(error) = write_json(&state.history_path, &*history) {
+                    eprintln!("[download] failed to persist history for task {task_id}: {error}");
                 }
             }
-            let _ = write_json(&state.history_path, &*history);
+            Err(_) => eprintln!("[download] history-state lock poisoned for task {task_id}"),
         }
 
         let _ = app.emit(

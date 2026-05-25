@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     sync::{Mutex, MutexGuard},
     thread,
@@ -49,6 +49,36 @@ where
 
 pub fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
     mutex.lock().map_err(|_| "内部状态锁已损坏".to_string())
+}
+
+pub fn default_download_dir() -> Result<PathBuf, String> {
+    dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| "无法定位下载目录，请手动选择一个下载目录。".to_string())
+}
+
+pub fn validate_download_dir(value: &str, app_dir: &Path) -> Result<PathBuf, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("请选择下载目录。".into());
+    }
+
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err("下载目录必须是绝对路径。".into());
+    }
+    if is_path_root(&path) {
+        return Err("不能直接下载到磁盘根目录。".into());
+    }
+    if path == app_dir {
+        return Err("不能把下载目录设为应用数据目录。".into());
+    }
+
+    Ok(path)
+}
+
+fn is_path_root(path: &Path) -> bool {
+    path.parent().is_none() || path.parent().is_some_and(|parent| parent == path)
 }
 
 pub fn strip_ansi(value: &str) -> String {

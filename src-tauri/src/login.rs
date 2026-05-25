@@ -5,26 +5,33 @@ use std::{
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::{
+    commands::{ensure_tdl_update_not_running, OperationGuard},
     state::AppState,
     tdl::resolve_tdl,
-    types::{LoginEvent, LoginEventKind, LoginMethod, LoginRequest, LoginResultStatus, LoginStarted, LoginStatus},
-    util::{apply_hidden_process_flags, lock, strip_ansi},
+    tdl_config::{prepend_tdl_global_args, session_targets},
+    types::{
+        AppConfig, LoginEvent, LoginEventKind, LoginMethod, LoginRequest, LoginResultStatus,
+        LoginStarted, LoginStatus, LoginStatusRequest,
+    },
+    util::{apply_hidden_process_flags, lock, run_with_timeout, strip_ansi},
 };
 
-const LOGIN_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+const LOGIN_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tauri::command]
 pub async fn check_login_status(
     app: AppHandle,
     state: State<'_, AppState>,
+    request: Option<LoginStatusRequest>,
 ) -> Result<LoginStatus, String> {
+    ensure_tdl_update_not_running(&state, "tdl 正在更新，请等待更新完成后再检查登录状态。")?;
     let tdl = resolve_tdl(&app, &state)?;
     if !tdl.available {
         return Ok(login_status(
@@ -36,30 +43,56 @@ pub async fn check_login_status(
         ));
     }
 
+    let config = lock(&state.config)?.clone();
+    if !tdl_session_exists(&config)? {
+        return Ok(login_status(
+            false,
+            "tdl 尚未登录 Telegram。",
+            None,
+            None,
+            None,
+        ));
+    }
+
+    if !request.is_some_and(|request| request.verify_online) {
+        return Ok(login_status(
+            true,
+            "本机存在 tdl Telegram 登录态。",
+            None,
+            None,
+            None,
+        ));
+    }
+
     let tdl_path = PathBuf::from(
         tdl.path
             .ok_or_else(|| "tdl 路径不可用，无法检查登录状态。".to_string())?,
     );
 
-    tauri::async_runtime::spawn_blocking(move || {
-        check_login_status_with_helper_or_tdl(app, tdl_path)
-    })
-    .await
-    .map_err(|error| format!("检查 Telegram 登录状态失败: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || check_login_status_with_tdl(tdl_path, config))
+        .await
+        .map_err(|error| format!("检查 Telegram 登录状态失败: {error}"))?
 }
 
-fn check_login_status_with_helper_or_tdl(
-    _app: AppHandle,
+fn check_login_status_with_tdl(
     tdl_path: PathBuf,
+    config: AppConfig,
 ) -> Result<LoginStatus, String> {
-    check_login_status_with_tdl(tdl_path)
-}
-
-fn check_login_status_with_tdl(tdl_path: PathBuf) -> Result<LoginStatus, String> {
     let mut command = Command::new(&tdl_path);
     apply_hidden_process_flags(&mut command);
+    let args = prepend_tdl_global_args(
+        &config,
+        vec![
+            "chat".to_string(),
+            "ls".to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+            "-f".to_string(),
+            "false".to_string(),
+        ],
+    );
     command
-        .args(["chat", "ls", "-o", "json", "-f", "false"])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
@@ -67,13 +100,13 @@ fn check_login_status_with_tdl(tdl_path: PathBuf) -> Result<LoginStatus, String>
     let output = match run_with_timeout(command, LOGIN_CHECK_TIMEOUT) {
         Ok(output) => output,
         Err(error) => {
-            return Ok(login_status(
-                false,
-                "无法确认 Telegram 登录状态。",
-                Some(error),
-                None,
-                None,
-            ));
+            let lower_error = error.to_ascii_lowercase();
+            let message = if lower_error.contains("超时") || lower_error.contains("timeout") {
+                "连接 Telegram 超时，请检查网络或代理设置。"
+            } else {
+                "无法确认 Telegram 登录状态。"
+            };
+            return Ok(login_status(false, message, Some(error), None, None));
         }
     };
 
@@ -89,8 +122,13 @@ fn check_login_status_with_tdl(tdl_path: PathBuf) -> Result<LoginStatus, String>
     }
 
     let detail = output_detail(&output.stdout, &output.stderr);
-    let message = if detail.to_ascii_lowercase().contains("not authorized") {
+    let lower_detail = detail.to_ascii_lowercase();
+    let message = if lower_detail.contains("not authorized") {
         "tdl 尚未登录 Telegram。"
+    } else if lower_detail.contains("context deadline exceeded")
+        || lower_detail.contains("dial failed")
+    {
+        "无法连接 Telegram，请检查网络或代理设置。"
     } else {
         "无法确认 Telegram 登录状态。"
     };
@@ -110,6 +148,7 @@ pub fn start_login(
     state: State<'_, AppState>,
     request: LoginRequest,
 ) -> Result<LoginStarted, String> {
+    let operation_guard = OperationGuard::login(&state)?;
     if !lock(&state.running)?.is_empty() {
         return Err("当前还有下载任务在执行，请等任务结束或取消后再登录。".into());
     }
@@ -126,8 +165,10 @@ pub fn start_login(
 
     let mut command = Command::new(&tdl_path);
     apply_hidden_process_flags(&mut command);
+    let config = lock(&state.config)?.clone();
+    let login_args = prepend_tdl_global_args(&config, build_login_args(&request));
     command
-        .args(build_login_args(&request))
+        .args(&login_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
@@ -142,6 +183,7 @@ pub fn start_login(
     {
         *lock(&state.login)? = Some(Arc::clone(&child));
         *lock(&state.login_cancelled)? = false;
+        drop(operation_guard);
     }
 
     let qr_lines = Arc::new(Mutex::new(Vec::new()));
@@ -172,6 +214,7 @@ pub fn cancel_login(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub fn logout(state: State<'_, AppState>) -> Result<LoginStatus, String> {
+    ensure_tdl_update_not_running(&state, "tdl 正在更新，请等待更新完成后再退出登录。")?;
     if !lock(&state.running)?.is_empty() {
         return Err("当前还有下载任务在执行，请等任务结束或取消后再退出登录。".into());
     }
@@ -179,11 +222,12 @@ pub fn logout(state: State<'_, AppState>) -> Result<LoginStatus, String> {
         return Err("当前有登录流程在运行，请先取消或等待完成。".into());
     }
 
-    let home =
-        dirs::home_dir().ok_or_else(|| "无法定位用户目录，不能清理 tdl 登录态。".to_string())?;
-    let tdl_dir = home.join(".tdl");
-    remove_if_exists(&tdl_dir.join("data").join("default"))?;
-    remove_if_exists(&tdl_dir.join("data.kv"))?;
+    let config = lock(&state.config)?.clone();
+    let targets = session_targets(&config)?;
+    remove_if_exists(&targets.namespace_dir)?;
+    for legacy_file in targets.legacy_files {
+        remove_if_exists(&legacy_file)?;
+    }
 
     Ok(login_status(
         false,
@@ -198,6 +242,11 @@ pub fn logout(state: State<'_, AppState>) -> Result<LoginStatus, String> {
 struct AccountInfo {
     username: Option<String>,
     display_name: Option<String>,
+}
+
+fn tdl_session_exists(config: &AppConfig) -> Result<bool, String> {
+    let targets = session_targets(config)?;
+    Ok(targets.namespace_dir.exists() || targets.legacy_files.iter().any(|path| path.exists()))
 }
 
 fn login_status(
@@ -341,9 +390,12 @@ fn flush_login_line(
     }
 
     if is_qr_line(&line) {
-        if let Ok(mut lines) = qr_lines.lock() {
-            lines.push(line);
-            emit_login_qr(app, login_id, lines.join("\n"));
+        match qr_lines.lock() {
+            Ok(mut lines) => {
+                lines.push(line);
+                emit_login_qr(app, login_id, lines.join("\n"));
+            }
+            Err(_) => eprintln!("[login] QR buffer lock poisoned for login {login_id}"),
         }
     } else {
         emit_login_output(app, login_id, line.trim().to_string());
@@ -351,7 +403,25 @@ fn flush_login_line(
 }
 
 fn is_qr_line(line: &str) -> bool {
-    line.contains('█') || line.contains('▀') || line.contains('▄')
+    line.chars().any(|ch| {
+        matches!(
+            ch,
+            '█' | '▀'
+                | '▄'
+                | '▌'
+                | '▐'
+                | '▖'
+                | '▗'
+                | '▘'
+                | '▙'
+                | '▚'
+                | '▛'
+                | '▜'
+                | '▝'
+                | '▞'
+                | '▟'
+        )
+    })
 }
 
 fn emit_login_output(app: &AppHandle, login_id: &str, line: String) {
@@ -397,7 +467,10 @@ fn spawn_login_monitor(
             let status = {
                 let mut child = match child.lock() {
                     Ok(child) => child,
-                    Err(_) => break None,
+                    Err(_) => {
+                        eprintln!("[login] child process lock poisoned for login {login_id}");
+                        break None;
+                    }
                 };
                 child.try_wait()
             };
@@ -409,17 +482,21 @@ fn spawn_login_monitor(
             }
         };
 
-        if let Ok(mut login) = login.lock() {
-            *login = None;
+        match login.lock() {
+            Ok(mut login) => *login = None,
+            Err(_) => eprintln!("[login] login-state lock poisoned for login {login_id}"),
         }
-        let cancelled = login_cancelled
-            .lock()
-            .map(|mut value| {
+        let cancelled = match login_cancelled.lock() {
+            Ok(mut value) => {
                 let cancelled = *value;
                 *value = false;
                 cancelled
-            })
-            .unwrap_or(false);
+            }
+            Err(_) => {
+                eprintln!("[login] cancellation-state lock poisoned for login {login_id}");
+                false
+            }
+        };
 
         let (status, message, error) = if cancelled {
             (
@@ -449,36 +526,6 @@ fn spawn_login_monitor(
             },
         );
     });
-}
-
-fn run_with_timeout(
-    mut command: Command,
-    timeout: Duration,
-) -> Result<std::process::Output, String> {
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("启动 tdl 状态检查失败: {error}"))?;
-    let started = Instant::now();
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|error| format!("读取 tdl 状态检查输出失败: {error}"))
-            }
-            Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(120)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait_with_output();
-                return Err("检查 Telegram 登录状态超时。".into());
-            }
-            Err(error) => {
-                let _ = child.kill();
-                return Err(format!("检查 tdl 状态失败: {error}"));
-            }
-        }
-    }
 }
 
 fn output_detail(stdout: &[u8], stderr: &[u8]) -> String {

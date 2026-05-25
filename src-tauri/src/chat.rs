@@ -3,8 +3,11 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -12,36 +15,70 @@ use serde_json::Value;
 use tauri::{path::BaseDirectory, AppHandle, Manager, State};
 
 use crate::{
+    commands::OperationGuard,
     download::{spawn_output_reader, spawn_process_monitor_with_cleanup},
     state::AppState,
     tdl::resolve_tdl,
+    tdl_config::prepend_tdl_global_args,
     types::{
         AppConfig, ChatDownloadRequest, ChatInfo, ChatMediaPreview, ChatMediaPreviewFile,
         DownloadRecord, DownloadStarted, DownloadStatus, MediaKind, MessageInfo, SourceMode,
     },
-    util::{apply_hidden_process_flags, lock, preview_command, run_with_timeout},
+    util::{
+        apply_hidden_process_flags, lock, preview_command, run_with_timeout, validate_download_dir,
+    },
 };
 
 const CHAT_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 const CHAT_EXPORT_TIMEOUT: Duration = Duration::from_secs(90);
 const MEDIA_PREVIEW_TIMEOUT: Duration = Duration::from_secs(600);
 
+static TDL_DATABASE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 #[derive(Clone)]
 struct PreviewContext {
     app_dir: PathBuf,
     config: Arc<Mutex<AppConfig>>,
+    cache_generation: Arc<AtomicU64>,
 }
 
 #[tauri::command]
-pub async fn list_chats(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<ChatInfo>, String> {
+pub fn clear_chat_cache(state: State<'_, AppState>) -> Result<(), String> {
+    state.cache_generation.fetch_add(1, Ordering::SeqCst);
+    for (path, label) in [
+        (state.app_dir.join("previews"), "缩略图缓存"),
+        (state.app_dir.join("chat"), "对话缓存"),
+    ] {
+        if path.exists() {
+            fs::remove_dir_all(&path)
+                .map_err(|error| format!("清理{label}失败 ({}): {error}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_chats(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<ChatInfo>, String> {
+    crate::commands::ensure_tdl_update_not_running(
+        &state,
+        "tdl 正在更新，请等待更新完成后再读取对话列表。",
+    )?;
     let tdl_path = resolve_tdl_path(&app, &state)?;
+    let config = lock(&state.config)?.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let args = vec![
-            "chat".to_string(),
-            "ls".to_string(),
-            "-o".to_string(),
-            "json".to_string(),
-        ];
+        let args = prepend_tdl_global_args(
+            &config,
+            vec![
+                "chat".to_string(),
+                "ls".to_string(),
+                "-o".to_string(),
+                "json".to_string(),
+            ],
+        );
+        let _guard = tdl_database_guard()?;
         let output = run_tdl_with_timeout(&tdl_path, &args, CHAT_LIST_TIMEOUT)?;
         let value: Value = serde_json::from_slice(&output.stdout)
             .map_err(|error| format!("解析对话列表失败: {error}"))?;
@@ -62,26 +99,37 @@ pub fn export_chat_messages(
     chat_id: String,
     count: i64,
 ) -> Result<Vec<MessageInfo>, String> {
+    crate::commands::ensure_tdl_update_not_running(
+        &state,
+        "tdl 正在更新，请等待更新完成后再读取消息。",
+    )?;
     let tdl_path = resolve_tdl_path(&app, &state)?;
     let output_path = temp_chat_json(&state, "messages")?;
+    let config = lock(&state.config)?.clone();
     let count = count.clamp(1, 500);
-    let args = vec![
-        "chat".to_string(),
-        "export".to_string(),
-        "--with-content".to_string(),
-        "--all".to_string(),
-        "-T".to_string(),
-        "last".to_string(),
-        "-c".to_string(),
-        chat_id,
-        "-i".to_string(),
-        count.to_string(),
-        "-o".to_string(),
-        output_path.to_string_lossy().to_string(),
-    ];
+    let args = prepend_tdl_global_args(
+        &config,
+        vec![
+            "chat".to_string(),
+            "export".to_string(),
+            "--with-content".to_string(),
+            "--all".to_string(),
+            "-T".to_string(),
+            "last".to_string(),
+            "-c".to_string(),
+            chat_id,
+            "-i".to_string(),
+            count.to_string(),
+            "-o".to_string(),
+            output_path.to_string_lossy().to_string(),
+        ],
+    );
 
-    let result = run_tdl_with_timeout(&tdl_path, &args, CHAT_EXPORT_TIMEOUT)
-        .and_then(|_| parse_messages_file(&output_path));
+    let result = (|| {
+        let _guard = tdl_database_guard()?;
+        run_tdl_with_timeout(&tdl_path, &args, CHAT_EXPORT_TIMEOUT)?;
+        parse_messages_file(&output_path)
+    })();
     let _ = fs::remove_file(&output_path);
     result
 }
@@ -92,16 +140,15 @@ pub fn download_from_chat(
     state: State<'_, AppState>,
     request: ChatDownloadRequest,
 ) -> Result<DownloadStarted, String> {
+    let operation_guard = OperationGuard::download(&state)?;
     if request.message_ids.is_empty() {
         return Err("请至少选择一条消息。".into());
     }
-    let directory = request.directory.trim();
-    if directory.is_empty() {
-        return Err("请选择下载目录。".into());
-    }
-    fs::create_dir_all(directory).map_err(|error| format!("无法创建下载目录: {error}"))?;
+    let directory = validate_download_dir(&request.directory, &state.app_dir)?;
+    fs::create_dir_all(&directory).map_err(|error| format!("无法创建下载目录: {error}"))?;
 
     let tdl_path = resolve_tdl_path(&app, &state)?;
+    let config = lock(&state.config)?.clone();
     let mut selected_ids = request.message_ids.clone();
     selected_ids.sort_unstable();
     selected_ids.dedup();
@@ -111,9 +158,13 @@ pub fn download_from_chat(
         &request.chat_id,
         &selected_ids,
         "selected",
+        &config,
     )?;
 
-    let download_args = build_chat_download_args(&request, &export_path);
+    let download_args = prepend_tdl_global_args(
+        &config,
+        build_chat_download_args(&request, &directory, &export_path),
+    );
     let mut command = Command::new(&tdl_path);
     apply_hidden_process_flags(&mut command);
     command
@@ -134,7 +185,7 @@ pub fn download_from_chat(
         task_id: task_id.clone(),
         source: format!("{} · {} 条消息", request.chat_name, selected_ids.len()),
         mode: SourceMode::Chat,
-        directory: directory.to_string(),
+        directory: directory.to_string_lossy().to_string(),
         status: DownloadStatus::Downloading,
         created_at,
         completed_at: None,
@@ -150,6 +201,7 @@ pub fn download_from_chat(
 
     let child = Arc::new(Mutex::new(child));
     lock(&state.running)?.insert(task_id.clone(), Arc::clone(&child));
+    drop(operation_guard);
 
     if let Some(stream) = stdout {
         spawn_output_reader(app.clone(), task_id.clone(), stream);
@@ -181,9 +233,14 @@ pub async fn preview_chat_media(
     chat_id: String,
     message_id: i64,
 ) -> Result<ChatMediaPreview, String> {
+    crate::commands::ensure_tdl_update_not_running(
+        &state,
+        "tdl 正在更新，请等待更新完成后再加载预览。",
+    )?;
     let context = PreviewContext {
         app_dir: state.app_dir.clone(),
         config: Arc::clone(&state.config),
+        cache_generation: Arc::clone(&state.cache_generation),
     };
     tauri::async_runtime::spawn_blocking(move || {
         preview_chat_media_blocking(app, context, chat_id, message_id)
@@ -198,39 +255,64 @@ fn preview_chat_media_blocking(
     chat_id: String,
     message_id: i64,
 ) -> Result<ChatMediaPreview, String> {
+    let generation = context.cache_generation.load(Ordering::SeqCst);
     let tdl_path = resolve_tdl_path_for_preview(&app, &context)?;
+    ensure_preview_generation(&context, generation)?;
     let preview_dir = media_preview_dir_for(&context.app_dir, &chat_id, message_id);
     fs::create_dir_all(&preview_dir).map_err(|error| format!("无法创建媒体预览目录: {error}"))?;
 
     let mut files = collect_preview_files(&preview_dir)?;
     if files.is_empty() {
+        let config = lock(&context.config)?.clone();
         let export_path = export_exact_messages_in_dir(
             &tdl_path,
             &context.app_dir,
             &chat_id,
             &[message_id],
             "preview",
+            &config,
+            Some((&context.cache_generation, generation)),
         )?;
-        let args = vec![
-            "download".to_string(),
-            "-d".to_string(),
-            preview_dir.to_string_lossy().to_string(),
-            "-l".to_string(),
-            "1".to_string(),
-            "-t".to_string(),
-            "1".to_string(),
-            "-f".to_string(),
-            export_path.to_string_lossy().to_string(),
-            "--skip-same".to_string(),
-            "--pool".to_string(),
-            "1".to_string(),
-            "--template".to_string(),
-            "{{ .MessageID }}_{{ filenamify .FileName }}".to_string(),
-        ];
+        let args = prepend_tdl_global_args(
+            &config,
+            vec![
+                "download".to_string(),
+                "-d".to_string(),
+                preview_dir.to_string_lossy().to_string(),
+                "-l".to_string(),
+                "1".to_string(),
+                "-t".to_string(),
+                "1".to_string(),
+                "-f".to_string(),
+                export_path.to_string_lossy().to_string(),
+                "--skip-same".to_string(),
+                "--pool".to_string(),
+                "1".to_string(),
+                "--template".to_string(),
+                "{{ .MessageID }}_{{ filenamify .FileName }}".to_string(),
+            ],
+        );
 
-        let result = run_tdl_with_timeout(&tdl_path, &args, MEDIA_PREVIEW_TIMEOUT);
+        let result = (|| {
+            let _guard = tdl_database_guard()?;
+            run_tdl_with_timeout_for_generation(
+                &tdl_path,
+                &args,
+                MEDIA_PREVIEW_TIMEOUT,
+                &context.cache_generation,
+                generation,
+            )
+        })();
         let _ = fs::remove_file(&export_path);
-        result?;
+        match result {
+            Ok(_) => ensure_preview_generation(&context, generation)?,
+            Err(error) => {
+                if context.cache_generation.load(Ordering::SeqCst) != generation {
+                    let _ = fs::remove_dir_all(&preview_dir);
+                }
+                return Err(error);
+            }
+        }
         files = collect_preview_files(&preview_dir)?;
     }
 
@@ -344,6 +426,13 @@ fn find_tdl_in_path() -> Option<PathBuf> {
     None
 }
 
+fn tdl_database_guard() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    TDL_DATABASE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "tdl 数据库访问锁已损坏。".to_string())
+}
+
 fn run_tdl_with_timeout(
     tdl_path: &Path,
     args: &[String],
@@ -358,6 +447,31 @@ fn run_tdl_with_timeout(
         .stdin(Stdio::null());
 
     let output = run_with_timeout(command, timeout)?;
+    ensure_tdl_success(output)
+}
+
+fn run_tdl_with_timeout_for_generation(
+    tdl_path: &Path,
+    args: &[String],
+    timeout: Duration,
+    generation_source: &AtomicU64,
+    generation: u64,
+) -> Result<std::process::Output, String> {
+    let mut command = Command::new(tdl_path);
+    apply_hidden_process_flags(&mut command);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+
+    let output = run_with_timeout_until(command, timeout, || {
+        generation_source.load(Ordering::SeqCst) != generation
+    })?;
+    ensure_tdl_success(output)
+}
+
+fn ensure_tdl_success(output: std::process::Output) -> Result<std::process::Output, String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -365,6 +479,51 @@ fn run_tdl_with_timeout(
         return Err(compact_message(detail));
     }
     Ok(output)
+}
+
+fn run_with_timeout_until(
+    mut command: Command,
+    timeout: Duration,
+    should_cancel: impl Fn() -> bool,
+) -> Result<std::process::Output, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("启动进程失败: {error}"))?;
+    let started = Instant::now();
+
+    loop {
+        if should_cancel() {
+            let _ = child.kill();
+            let _ = child.wait_with_output();
+            return Err("预览缓存已清理，已取消旧预览任务。".into());
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| format!("读取进程输出失败: {error}"))
+            }
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(120));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait_with_output();
+                return Err("操作超时，请确认已登录 tdl 且网络可用。".into());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                return Err(format!("检查进程状态失败: {error}"));
+            }
+        }
+    }
+}
+
+fn ensure_preview_generation(context: &PreviewContext, generation: u64) -> Result<(), String> {
+    if context.cache_generation.load(Ordering::SeqCst) != generation {
+        return Err("预览缓存已清理，已取消旧预览任务。".into());
+    }
+    Ok(())
 }
 
 fn temp_chat_json(state: &AppState, prefix: &str) -> Result<PathBuf, String> {
@@ -469,12 +628,15 @@ fn export_exact_messages(
     chat_id: &str,
     message_ids: &[i64],
     prefix: &str,
+    config: &AppConfig,
 ) -> Result<PathBuf, String> {
     export_exact_messages_with_output(
         tdl_path,
         temp_chat_json(state, prefix)?,
         chat_id,
         message_ids,
+        config,
+        None,
     )
 }
 
@@ -484,6 +646,8 @@ fn export_exact_messages_in_dir(
     chat_id: &str,
     message_ids: &[i64],
     prefix: &str,
+    config: &AppConfig,
+    generation: Option<(&AtomicU64, u64)>,
 ) -> Result<PathBuf, String> {
     let prefix = format!(
         "{prefix}-{}",
@@ -494,6 +658,8 @@ fn export_exact_messages_in_dir(
         temp_chat_json_in_dir(app_dir, &prefix)?,
         chat_id,
         message_ids,
+        config,
+        generation,
     )
 }
 
@@ -502,6 +668,8 @@ fn export_exact_messages_with_output(
     output_path: PathBuf,
     chat_id: &str,
     message_ids: &[i64],
+    config: &AppConfig,
+    generation: Option<(&AtomicU64, u64)>,
 ) -> Result<PathBuf, String> {
     if message_ids.is_empty() {
         return Err("请至少选择一条消息。".into());
@@ -512,31 +680,51 @@ fn export_exact_messages_with_output(
     let selected_set: HashSet<i64> = selected_ids.iter().copied().collect();
     let first_id = selected_ids[0];
     let last_id = selected_ids[selected_ids.len() - 1];
-    let export_args = vec![
-        "chat".to_string(),
-        "export".to_string(),
-        "--with-content".to_string(),
-        "--all".to_string(),
-        "-T".to_string(),
-        "id".to_string(),
-        "-c".to_string(),
-        chat_id.to_string(),
-        "-i".to_string(),
-        format!("{first_id},{last_id}"),
-        "-o".to_string(),
-        output_path.to_string_lossy().to_string(),
-    ];
+    let export_args = prepend_tdl_global_args(
+        config,
+        vec![
+            "chat".to_string(),
+            "export".to_string(),
+            "--with-content".to_string(),
+            "--all".to_string(),
+            "-T".to_string(),
+            "id".to_string(),
+            "-c".to_string(),
+            chat_id.to_string(),
+            "-i".to_string(),
+            format!("{first_id},{last_id}"),
+            "-o".to_string(),
+            output_path.to_string_lossy().to_string(),
+        ],
+    );
 
-    run_tdl_with_timeout(tdl_path, &export_args, CHAT_EXPORT_TIMEOUT)?;
+    {
+        let _guard = tdl_database_guard()?;
+        if let Some((generation_source, expected_generation)) = generation {
+            run_tdl_with_timeout_for_generation(
+                tdl_path,
+                &export_args,
+                CHAT_EXPORT_TIMEOUT,
+                generation_source,
+                expected_generation,
+            )?;
+        } else {
+            run_tdl_with_timeout(tdl_path, &export_args, CHAT_EXPORT_TIMEOUT)?;
+        }
+    }
     filter_exported_messages(&output_path, &selected_set)?;
     Ok(output_path)
 }
 
-fn build_chat_download_args(request: &ChatDownloadRequest, file: &Path) -> Vec<String> {
+fn build_chat_download_args(
+    request: &ChatDownloadRequest,
+    directory: &Path,
+    file: &Path,
+) -> Vec<String> {
     let mut args = vec![
         "download".to_string(),
         "-d".to_string(),
-        request.directory.trim().to_string(),
+        directory.to_string_lossy().to_string(),
         "-l".to_string(),
         request.limit.max(1).to_string(),
         "-t".to_string(),
@@ -587,14 +775,25 @@ fn push_csv_arg(args: &mut Vec<String>, flag: &str, value: &str) {
 
 fn parse_chat_info(value: &Value) -> Option<ChatInfo> {
     let id = get_i64(value, &["id", "ID"])?;
+    let chat_type = get_string(value, &["type", "chat_type", "chatType"]).unwrap_or_default();
     let name = get_string(value, &["visible_name", "visibleName", "name", "title"])
-        .unwrap_or_else(|| id.to_string());
+        .unwrap_or_else(|| format!("{} {id}", chat_type_label(&chat_type)));
     Some(ChatInfo {
         id,
         name,
-        chat_type: get_string(value, &["type", "chat_type", "chatType"]).unwrap_or_default(),
+        chat_type,
         username: get_string(value, &["username", "user_name", "userName"]),
     })
+}
+
+fn chat_type_label(chat_type: &str) -> &'static str {
+    match chat_type.to_ascii_lowercase().as_str() {
+        "channel" => "Channel",
+        "group" | "supergroup" => "Group",
+        "private" | "user" => "User",
+        "bot" => "Bot",
+        _ => "Chat",
+    }
 }
 
 fn parse_messages_file(path: &Path) -> Result<Vec<MessageInfo>, String> {

@@ -12,18 +12,28 @@ use crate::{
     download::{build_download_args, build_records, spawn_output_reader, spawn_process_monitor},
     state::AppState,
     tdl::{resolve_tdl, update_tdl as update_tdl_impl},
+    tdl_config::{add_missing_raw_global_args, prepend_tdl_global_args},
     types::{
-        AppConfig, AppSnapshot, DownloadRequest, DownloadStarted, SourceMode, TdlInfo,
-        TdlUpdateEvent, TdlUpdateStatus,
+        AppConfig, AppSnapshot, DesktopUpdateStatus, DownloadRequest, DownloadStarted,
+        LogPackageInfo, SourceMode, TdlInfo, TdlUpdateEvent, TdlUpdateStatus,
     },
-    util::{apply_hidden_process_flags, lock, preview_command},
+    util::{apply_hidden_process_flags, lock, preview_command, validate_download_dir},
 };
 
 #[tauri::command]
 pub fn get_app_state(app: AppHandle, state: State<'_, AppState>) -> Result<AppSnapshot, String> {
     let config = lock(&state.config)?.clone();
     let history = lock(&state.history)?.clone();
-    let tdl = resolve_tdl(&app, &state)?;
+    let tdl = if *lock(&state.tdl_update_running)? {
+        TdlInfo {
+            available: false,
+            version: None,
+            path: None,
+            source: crate::types::TdlSource::Missing,
+        }
+    } else {
+        resolve_tdl(&app, &state)?
+    };
 
     Ok(AppSnapshot {
         config,
@@ -50,13 +60,30 @@ pub fn pick_directory() -> Option<String> {
 }
 
 #[tauri::command]
-pub fn preview_download_command(request: DownloadRequest) -> Result<String, String> {
+pub fn pick_log_directory() -> Option<String> {
+    rfd::FileDialog::new()
+        .pick_folder()
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn preview_download_command(
+    state: State<'_, AppState>,
+    request: DownloadRequest,
+) -> Result<String, String> {
+    let config = lock(&state.config)?.clone();
     let args = build_download_args(&request)?;
+    let args = if request.mode == SourceMode::Raw {
+        add_missing_raw_global_args(&config, args)
+    } else {
+        prepend_tdl_global_args(&config, args)
+    };
     Ok(preview_command("tdl", &args))
 }
 
 #[tauri::command]
 pub fn refresh_tdl_info(app: AppHandle, state: State<'_, AppState>) -> Result<TdlInfo, String> {
+    ensure_tdl_update_not_running(&state, "tdl 正在更新，请等待更新完成后再刷新状态。")?;
     resolve_tdl(&app, &state)
 }
 
@@ -66,12 +93,13 @@ pub fn start_download(
     state: State<'_, AppState>,
     request: DownloadRequest,
 ) -> Result<DownloadStarted, String> {
+    let operation_guard = OperationGuard::download(&state)?;
     let tdl = resolve_tdl(&app, &state)?;
     if !tdl.available {
         return Err("未找到可用的 tdl.exe。发布包应内置 tdl.exe,也可以手动更新 tdl。".into());
     }
-    if request.mode == SourceMode::TgLite {
-        return Err("TG Lite 模式请在 TG Lite 页面选择消息下载。".into());
+    if request.mode == SourceMode::Chat {
+        return Err("对话模式请使用对话下载命令。".into());
     }
 
     let tdl_path = PathBuf::from(
@@ -79,11 +107,17 @@ pub fn start_download(
             .clone()
             .ok_or_else(|| "tdl 路径不可用".to_string())?,
     );
+    let config = lock(&state.config)?.clone();
     let args = build_download_args(&request)?;
+    let args = if request.mode == SourceMode::Raw {
+        add_missing_raw_global_args(&config, args)
+    } else {
+        prepend_tdl_global_args(&config, args)
+    };
 
     if request.mode != SourceMode::Raw {
-        fs::create_dir_all(request.directory.trim())
-            .map_err(|error| format!("无法创建下载目录: {error}"))?;
+        let directory = validate_download_dir(&request.directory, &state.app_dir)?;
+        fs::create_dir_all(&directory).map_err(|error| format!("无法创建下载目录: {error}"))?;
     }
 
     let mut command = Command::new(&tdl_path);
@@ -113,6 +147,7 @@ pub fn start_download(
 
     let child = Arc::new(Mutex::new(child));
     lock(&state.running)?.insert(task_id.clone(), Arc::clone(&child));
+    drop(operation_guard);
 
     if let Some(stream) = stdout {
         spawn_output_reader(app.clone(), task_id.clone(), stream);
@@ -157,40 +192,342 @@ pub fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn update_tdl(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    {
-        let mut running = lock(&state.tdl_update_running)?;
-        if *running {
-            return Err("正在检查 tdl 更新，请稍候。".into());
-        }
-        *running = true;
+pub fn collect_logs(state: State<'_, AppState>) -> Result<LogPackageInfo, String> {
+    let config = lock(&state.config)?.clone();
+    let log_dir = configured_log_dir(&state, &config);
+    fs::create_dir_all(&log_dir).map_err(|error| format!("无法创建日志目录: {error}"))?;
+
+    let file_name = format!(
+        "tdl-desktop-logs-{}.txt",
+        Utc::now().format("%Y%m%d-%H%M%S")
+    );
+    let output_path = log_dir.join(&file_name);
+    let content = build_sanitized_log_report(&state, &config)?;
+    fs::write(&output_path, content).map_err(|error| format!("写入日志包失败: {error}"))?;
+    let size = fs::metadata(&output_path)
+        .map(|item| item.len())
+        .unwrap_or(0);
+
+    Ok(LogPackageInfo {
+        path: output_path.to_string_lossy().to_string(),
+        file_name,
+        size,
+        message: "日志包已生成，可手动提交给开发者分析。".into(),
+    })
+}
+
+#[tauri::command]
+pub fn check_desktop_update(state: State<'_, AppState>) -> Result<DesktopUpdateStatus, String> {
+    let config = lock(&state.config)?.clone();
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    if config.desktop_update_url.trim().is_empty() {
+        return Ok(DesktopUpdateStatus {
+            configured: false,
+            update_available: false,
+            current_version,
+            latest_version: None,
+            message: "TDL Desktop 更新地址未配置。".into(),
+        });
     }
 
+    Ok(DesktopUpdateStatus {
+        configured: true,
+        update_available: false,
+        current_version,
+        latest_version: None,
+        message: "TDL Desktop 更新检查暂未启用。".into(),
+    })
+}
+
+#[tauri::command]
+pub fn update_tdl(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let guard = UpdateRunningGuard::claim(&state)?;
+
     tauri::async_runtime::spawn_blocking(move || {
-        let result = app
-            .try_state::<AppState>()
-            .ok_or_else(|| "应用状态不可用。".to_string())
-            .and_then(|app_state| update_tdl_impl(&app, app_state.inner()));
-        if let Some(app_state) = app.try_state::<AppState>() {
-            if let Ok(mut running) = app_state.tdl_update_running.lock() {
-                *running = false;
-            }
-        }
+        let _guard = guard;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            app.try_state::<AppState>()
+                .ok_or_else(|| "应用状态不可用。".to_string())
+                .and_then(|app_state| update_tdl_impl(&app, app_state.inner()))
+        }));
 
         let event = match result {
-            Ok(info) => TdlUpdateEvent {
+            Ok(Ok(info)) => TdlUpdateEvent {
                 status: TdlUpdateStatus::Completed,
                 tdl: Some(info),
                 message: "tdl 已更新。".into(),
             },
-            Err(error) => TdlUpdateEvent {
+            Ok(Err(error)) => TdlUpdateEvent {
                 status: TdlUpdateStatus::Failed,
                 tdl: None,
                 message: error,
+            },
+            Err(_) => TdlUpdateEvent {
+                status: TdlUpdateStatus::Failed,
+                tdl: None,
+                message: "tdl 更新过程发生未预期错误。".into(),
             },
         };
         let _ = app.emit("tdl-update-event", event);
     });
 
     Ok(())
+}
+
+pub(crate) fn ensure_tdl_update_not_running(state: &AppState, message: &str) -> Result<(), String> {
+    if *lock(&state.tdl_update_running)? {
+        return Err(message.to_string());
+    }
+    Ok(())
+}
+
+pub(crate) struct OperationGuard<'a> {
+    _update_running: std::sync::MutexGuard<'a, bool>,
+}
+
+impl<'a> OperationGuard<'a> {
+    pub(crate) fn download(state: &'a AppState) -> Result<Self, String> {
+        Self::new(state, "tdl 正在更新，请等待更新完成后再开始下载。")
+    }
+
+    pub(crate) fn login(state: &'a AppState) -> Result<Self, String> {
+        Self::new(state, "tdl 正在更新，请等待更新完成后再登录。")
+    }
+
+    fn new(state: &'a AppState, message: &str) -> Result<Self, String> {
+        let update_running = lock(&state.tdl_update_running)?;
+        if *update_running {
+            return Err(message.to_string());
+        }
+        Ok(Self {
+            _update_running: update_running,
+        })
+    }
+}
+
+struct UpdateRunningGuard {
+    running: Arc<Mutex<bool>>,
+}
+
+impl UpdateRunningGuard {
+    fn claim(state: &AppState) -> Result<Self, String> {
+        {
+            let mut running = lock(&state.tdl_update_running)?;
+            if *running {
+                return Err("正在检查 tdl 更新，请稍候。".into());
+            }
+            if !lock(&state.running)?.is_empty() {
+                return Err("当前还有下载任务在执行，请等任务结束或取消后再更新 tdl。".into());
+            }
+            if lock(&state.login)?.is_some() {
+                return Err("当前有登录流程在运行，请先取消或等待完成。".into());
+            }
+            *running = true;
+        }
+        Ok(Self {
+            running: Arc::clone(&state.tdl_update_running),
+        })
+    }
+}
+
+impl Drop for UpdateRunningGuard {
+    fn drop(&mut self) {
+        match self.running.lock() {
+            Ok(mut running) => *running = false,
+            Err(_) => eprintln!("[tdl] tdl update state lock poisoned while clearing update flag"),
+        }
+    }
+}
+
+fn configured_log_dir(state: &AppState, config: &AppConfig) -> PathBuf {
+    if config.log_directory.trim().is_empty() {
+        state.default_log_dir()
+    } else {
+        PathBuf::from(config.log_directory.trim())
+    }
+}
+
+fn build_sanitized_log_report(state: &AppState, config: &AppConfig) -> Result<String, String> {
+    let history = lock(&state.history)?.clone();
+    let mut lines = vec![
+        "TDL Desktop Diagnostic Log".to_string(),
+        format!("generated_at={}", Utc::now().to_rfc3339()),
+        format!("app_version={}", env!("CARGO_PKG_VERSION")),
+        format!("language={}", sanitize_log_text(&config.language)),
+        format!("download_limit={}", config.limit),
+        format!("download_threads={}", config.threads),
+        format!("download_pool={}", config.pool),
+        format!("history_count={}", history.len()),
+        String::new(),
+        "Recent history".to_string(),
+    ];
+
+    for record in history.iter().take(20) {
+        lines.push(format!(
+            "- status={:?} mode={:?} source={} directory={} error={}",
+            record.status,
+            record.mode,
+            sanitize_log_text(&record.source),
+            sanitize_log_text(&record.directory),
+            sanitize_log_text(record.error.as_deref().unwrap_or("")),
+        ));
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn sanitize_log_text(value: &str) -> String {
+    let mut output = value.to_string();
+    if let Some(home) = dirs::home_dir().map(|path| path.to_string_lossy().to_string()) {
+        if !home.is_empty() {
+            output = output.replace(&home, "<USER_HOME>");
+        }
+    }
+    output = redact_tg_links(&output);
+    output = redact_bot_tokens(&output);
+    output = redact_key_values(
+        &output,
+        &[
+            "token",
+            "api_hash",
+            "authorization",
+            "password",
+            "passcode",
+            "access_token",
+        ],
+    );
+    output = redact_telegram_usernames(&output);
+    redact_long_numbers(&output)
+}
+
+fn redact_tg_links(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|part| {
+            let lower = part.to_ascii_lowercase();
+            if lower.contains("t.me/") || lower.contains("telegram.me/") || lower.contains("tg://")
+            {
+                "<TG_LINK>".to_string()
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_bot_tokens(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|part| {
+            let mut pieces = part.splitn(2, ':');
+            let id = pieces.next().unwrap_or_default();
+            let token = pieces.next().unwrap_or_default();
+            if id.starts_with("bot")
+                && id[3..].chars().all(|ch| ch.is_ascii_digit())
+                && token.len() >= 20
+            {
+                "<BOT_TOKEN>".to_string()
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_key_values(value: &str, keys: &[&str]) -> String {
+    value
+        .split_whitespace()
+        .map(|part| redact_key_value_part(part, keys))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_key_value_part(part: &str, keys: &[&str]) -> String {
+    let mut output = part.to_string();
+    for key in keys {
+        output = redact_key_value_with_separator(&output, key, '=');
+        output = redact_key_value_with_separator(&output, key, ':');
+    }
+    output
+}
+
+fn redact_key_value_with_separator(part: &str, key: &str, separator: char) -> String {
+    let lower = part.to_ascii_lowercase();
+    let key_lower = key.to_ascii_lowercase();
+    let Some(index) = find_key_separator(&lower, &key_lower, separator) else {
+        return part.to_string();
+    };
+    let value_start = index + key.len() + separator.len_utf8();
+    let value_end = part[value_start..]
+        .find(['&', ',', ';'])
+        .map(|offset| value_start + offset)
+        .unwrap_or(part.len());
+    if value_start == value_end {
+        return part.to_string();
+    }
+    format!("{}<SECRET>{}", &part[..value_start], &part[value_end..])
+}
+
+fn find_key_separator(value: &str, key: &str, separator: char) -> Option<usize> {
+    let needle = format!("{key}{separator}");
+    value.match_indices(&needle).find_map(|(index, _)| {
+        if index == 0 || matches!(value.as_bytes()[index - 1], b'?' | b'&' | b',' | b';') {
+            Some(index)
+        } else {
+            None
+        }
+    })
+}
+
+fn redact_telegram_usernames(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|part| {
+            if part.starts_with('@') && part.len() > 1 {
+                "<TG_USERNAME>".to_string()
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_long_numbers(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|part| {
+            let digits = part.chars().filter(|ch| ch.is_ascii_digit()).count();
+            if digits >= 8 {
+                "<PHONE_OR_ID>".to_string()
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_log_text;
+
+    #[test]
+    fn redacts_query_secrets_and_telegram_links() {
+        let output = sanitize_log_text("url=https://example.test/cb?token=abc123&ok=1 tg://resolve?domain=user https://t.me/name");
+        assert!(output.contains("token=<SECRET>&ok=1"));
+        assert!(!output.contains("abc123"));
+        assert!(!output.contains("tg://"));
+        assert!(!output.contains("t.me/name"));
+    }
+
+    #[test]
+    fn redacts_bot_tokens_and_usernames() {
+        let output = sanitize_log_text("bot123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ @someone");
+        assert!(output.contains("<BOT_TOKEN>"));
+        assert!(output.contains("<TG_USERNAME>"));
+        assert!(!output.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+    }
 }

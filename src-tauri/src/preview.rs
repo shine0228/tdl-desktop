@@ -9,10 +9,12 @@ use serde_json::Value;
 use tauri::{AppHandle, State};
 
 use crate::{
+    commands::ensure_tdl_update_not_running,
     state::AppState,
     tdl::resolve_tdl,
+    tdl_config::prepend_tdl_global_args,
     types::LinkPreview,
-    util::{apply_hidden_process_flags, run_with_timeout},
+    util::{apply_hidden_process_flags, lock, run_with_timeout},
 };
 
 const PREVIEW_TIMEOUT: Duration = Duration::from_secs(25);
@@ -23,6 +25,7 @@ pub fn preview_link(
     state: State<'_, AppState>,
     link: String,
 ) -> Result<LinkPreview, String> {
+    ensure_tdl_update_not_running(&state, "tdl 正在更新，请等待更新完成后再读取消息预览。")?;
     let parsed = parse_telegram_link(&link)?;
     let tdl = resolve_tdl(&app, &state)?;
     if !tdl.available {
@@ -42,22 +45,26 @@ pub fn preview_link(
         parsed.message_id
     ));
 
+    let config = lock(&state.config)?.clone();
     let mut command = Command::new(&tdl_path);
     apply_hidden_process_flags(&mut command);
-    let args = vec![
-        "chat".to_string(),
-        "export".to_string(),
-        "--with-content".to_string(),
-        "--all".to_string(),
-        "-T".to_string(),
-        "id".to_string(),
-        "-c".to_string(),
-        parsed.chat.clone(),
-        "-i".to_string(),
-        format!("{},{}", parsed.message_id, parsed.message_id),
-        "-o".to_string(),
-        output_path.to_string_lossy().to_string(),
-    ];
+    let args = prepend_tdl_global_args(
+        &config,
+        vec![
+            "chat".to_string(),
+            "export".to_string(),
+            "--with-content".to_string(),
+            "--all".to_string(),
+            "-T".to_string(),
+            "id".to_string(),
+            "-c".to_string(),
+            parsed.chat.clone(),
+            "-i".to_string(),
+            format!("{},{}", parsed.message_id, parsed.message_id),
+            "-o".to_string(),
+            output_path.to_string_lossy().to_string(),
+        ],
+    );
     command
         .args(&args)
         .stdout(Stdio::piped())

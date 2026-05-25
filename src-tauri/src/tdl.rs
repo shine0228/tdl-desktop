@@ -65,10 +65,6 @@ pub fn resolve_tdl(app: &AppHandle, state: &AppState) -> Result<TdlInfo, String>
 }
 
 pub fn update_tdl(app: &AppHandle, state: &AppState) -> Result<TdlInfo, String> {
-    if !lock(&state.running)?.is_empty() {
-        return Err("当前还有下载任务在执行,请等任务结束或取消后再更新 tdl。".into());
-    }
-
     let asset_name = windows_asset_name();
     let client = reqwest::blocking::Client::builder()
         .user_agent("TDL-Desktop")
@@ -94,9 +90,10 @@ pub fn update_tdl(app: &AppHandle, state: &AppState) -> Result<TdlInfo, String> 
         .bytes()
         .map_err(|error| format!("读取 tdl 下载内容失败: {error}"))?;
 
-    // 二次校验:仍可能在我们抢锁后又有任务起飞,这里再确认一次。
-    if !lock(&state.running)?.is_empty() {
-        return Err("下载期间检测到有任务在运行,已放弃更新。".into());
+    // 持有 running 锁直到替换完成，避免在替换 tdl.exe 时被新启动的下载任务占用。
+    let running = lock(&state.running)?;
+    if !running.is_empty() {
+        return Err("当前还有下载任务在执行，请等任务结束或取消后再更新 tdl。".into());
     }
 
     let tdl_path = state.local_tdl_path();
@@ -104,17 +101,18 @@ pub fn update_tdl(app: &AppHandle, state: &AppState) -> Result<TdlInfo, String> 
         fs::create_dir_all(parent).map_err(|error| format!("无法创建 tdl 目录: {error}"))?;
     }
 
-    // 先写到临时文件再原子替换,即便写入过程中目标文件被占用也不会留下半成品。
+    // 先写到临时文件再原子替换，即便写入过程中目标文件被占用也不会留下半成品。
     let tmp_path = tdl_path.with_extension("exe.tmp");
     extract_tdl_exe(bytes.as_ref(), &tmp_path)?;
     if get_tdl_version(&tmp_path).is_none() {
         let _ = fs::remove_file(&tmp_path);
-        return Err("tdl 已下载,但无法运行,可能是架构不匹配。".into());
+        return Err("tdl 已下载，但无法运行，可能是架构不匹配。".into());
     }
     fs::rename(&tmp_path, &tdl_path).map_err(|error| {
         let _ = fs::remove_file(&tmp_path);
         format!("替换 tdl.exe 失败 (可能正被占用): {error}")
     })?;
+    drop(running);
 
     {
         let mut config = lock(&state.config)?;

@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+fn default_language() -> String {
+    "zh".into()
+}
+
+fn default_tdl_namespace() -> String {
+    "default".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -8,10 +16,16 @@ pub struct AppConfig {
     pub threads: u8,
     pub pool: u8,
     pub tdl_override_path: Option<String>,
+    #[serde(default = "default_language")]
+    pub language: String,
     #[serde(default)]
-    pub tg_lite_api_id: String,
+    pub log_directory: String,
     #[serde(default)]
-    pub tg_lite_api_hash: String,
+    pub desktop_update_url: String,
+    #[serde(default = "default_tdl_namespace")]
+    pub tdl_namespace: String,
+    #[serde(default)]
+    pub tdl_storage: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,7 +106,6 @@ pub enum SourceMode {
     Json,
     Raw,
     Chat,
-    TgLite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,50 +235,6 @@ pub struct ChatMediaPreviewFile {
     pub size: Option<i64>,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TgLiteStatus {
-    pub configured: bool,
-    pub initialized: bool,
-    pub authorized: bool,
-    pub state: String,
-    pub message: String,
-    pub qr_link: Option<String>,
-    pub username: Option<String>,
-    pub display_name: Option<String>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TgLiteChat {
-    pub id: i64,
-    pub title: String,
-    pub chat_type: String,
-    pub unread_count: i32,
-    pub last_message_id: Option<i64>,
-    pub last_message_text: Option<String>,
-    pub order: Option<String>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "kind")]
-pub enum TgLiteEvent {
-    Status { status: TgLiteStatus },
-    Connection { state: String },
-    ChatUpsert { chat: TgLiteChat },
-    ChatDelete { chat_id: i64 },
-    MessageNew { chat_id: i64, message: MessageInfo },
-    MessageUpdate {
-        chat_id: i64,
-        message_id: i64,
-        message: Option<MessageInfo>,
-    },
-    MessageDelete { chat_id: i64, message_ids: Vec<i64> },
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginStatus {
@@ -274,6 +243,13 @@ pub struct LoginStatus {
     pub detail: Option<String>,
     pub username: Option<String>,
     pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginStatusRequest {
+    #[serde(default)]
+    pub verify_online: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,6 +315,25 @@ pub struct TdlUpdateEvent {
 pub enum TdlUpdateStatus {
     Completed,
     Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogPackageInfo {
+    pub path: String,
+    pub file_name: String,
+    pub size: u64,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopUpdateStatus {
+    pub configured: bool,
+    pub update_available: bool,
+    pub current_version: String,
+    pub latest_version: Option<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Deserialize)]
