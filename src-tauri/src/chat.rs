@@ -973,27 +973,32 @@ fn find_mime_type(value: &Value) -> Option<String> {
 }
 
 fn find_file_name(value: &Value) -> Option<String> {
-    const KEYS: &[&str] = &[
-        "file_name",
-        "fileName",
-        "filename",
-        "file",
-        "name",
-        "title",
-        "FileName",
-    ];
+    const DIRECT_KEYS: &[&str] = &["file_name", "fileName", "filename", "FileName", "file"];
+    const NESTED_KEYS: &[&str] = &["file_name", "fileName", "filename", "FileName"];
+    find_file_name_inner(value, DIRECT_KEYS, true)
+        .or_else(|| find_file_name_inner(value, NESTED_KEYS, false))
+}
+
+fn find_file_name_inner(value: &Value, keys: &[&str], allow_current_file_key: bool) -> Option<String> {
     match value {
         Value::Object(map) => {
-            for key in KEYS {
+            for key in keys {
+                if !allow_current_file_key && *key == "file" {
+                    continue;
+                }
                 if let Some(Value::String(text)) = map.get(*key) {
-                    if !text.trim().is_empty() {
-                        return Some(text.trim().to_string());
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        return Some(text.to_string());
                     }
                 }
             }
-            map.values().find_map(find_file_name)
+            map.values()
+                .find_map(|child| find_file_name_inner(child, keys, false))
         }
-        Value::Array(items) => items.iter().find_map(find_file_name),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_file_name_inner(child, keys, false)),
         _ => None,
     }
 }
@@ -1067,7 +1072,7 @@ fn detect_media_kind(
     if has_key_recursive(value, &["audio", "Audio", "voice", "Voice"]) {
         return MediaKind::Audio;
     }
-    if has_key_recursive(value, &["document", "Document", "file", "File"]) {
+    if has_key_recursive(value, &["document", "Document"]) {
         return MediaKind::Document;
     }
 
@@ -1282,6 +1287,29 @@ mod tests {
 
         assert_eq!(message.media_kind, MediaKind::None);
         assert_eq!(message.media_type, None);
+        assert!(!message.previewable);
+    }
+
+    #[test]
+    fn ignores_sender_names_and_titles_for_text_messages() {
+        let value = serde_json::json!({
+            "id": 2,
+            "type": "message",
+            "from": "Alice",
+            "from_id": "user123",
+            "text": "just text",
+            "reply_to_message": {
+                "id": 1,
+                "name": "Bob",
+                "title": "General chat",
+                "file": null
+            }
+        });
+
+        let message = parse_message_info(&value).unwrap();
+
+        assert_eq!(message.media_kind, MediaKind::None);
+        assert_eq!(message.file_name, None);
         assert!(!message.previewable);
     }
 }
