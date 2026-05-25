@@ -4,7 +4,6 @@ import {
   Bot,
   CheckSquare2,
   Download,
-  Eye,
   File,
   FolderOpen,
   Image as ImageIcon,
@@ -25,7 +24,6 @@ import {
   formatFileSize,
   loggedInLabel,
   mediaKindLabel,
-  previewButtonLabel,
 } from "../appUtils";
 import type { FullMedia } from "./MediaModal";
 import type { TranslationKey } from "../i18n";
@@ -359,17 +357,6 @@ function MessageBubble({
           {message.width && message.height ? <span>{message.width}x{message.height}</span> : null}
           {message.duration ? <span>{Math.round(message.duration)}s</span> : null}
         </div>
-        {message.previewable ? (
-          <button
-            className="preview-button"
-            type="button"
-            onClick={onPreview}
-            disabled={previewState.status === "loading"}
-          >
-            {previewState.status === "loading" ? <LoaderCircle size={15} /> : <Eye size={15} />}
-            {previewButtonLabel(message, previewState, t)}
-          </button>
-        ) : null}
         {previewState.status === "error" ? <div className="preview-error">{previewState.error}</div> : null}
       </div>
     </article>

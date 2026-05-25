@@ -152,7 +152,7 @@ function App() {
   const [mode, setMode] = useState<AppMode>("links");
   const [linksText, setLinksText] = useState("");
   const [filesText, setFilesText] = useState("");
-  const [rawArgs, setRawArgs] = useState("download ");
+  const rawArgs = "download ";
   const [directory, setDirectory] = useState("");
   const [group, setGroup] = useState(true);
   const [include, setInclude] = useState("");
@@ -960,10 +960,6 @@ function App() {
             <FileJson size={18} />
             {t("jsonImport")}
           </button>
-          <button className={`nav-item ${mode === "raw" ? "active" : ""}`} onClick={() => setMode("raw")}>
-            <Terminal size={18} />
-            {t("rawArgs")}
-          </button>
           <button className={`nav-item ${mode === "chat" ? "active" : ""}`} onClick={() => setMode("chat")}>
             <Bot size={18} />
             {t("chatBrowse")}
@@ -1103,30 +1099,26 @@ function App() {
                   </label>
                 ) : null}
 
-                {mode === "raw" ? (
-                  <label className="field">
-                    <span>{t("tdlArgs")}</span>
-                    <textarea
-                      value={rawArgs}
-                      onChange={(event) => setRawArgs(event.target.value)}
-                      spellCheck={false}
-                      placeholder="download -u https://t.me/tdl/1 --group"
-                    />
-                    <small className="field-warning">{t("rawArgsWarning")}</small>
-                  </label>
-                ) : null}
+                <div className="action-row">
+                  <button className="primary-button" onClick={startDownload} disabled={busy || running}>
+                    <Play size={17} />
+                    {t("startDownloadTask")}
+                  </button>
+                  <button className="danger-button" onClick={cancelDownload} disabled={!running}>
+                    <Square size={16} />
+                    {t("stopCurrentTask")}
+                  </button>
+                </div>
 
-                {mode !== "raw" ? (
-                  <div className="directory-row">
-                    <label className="field compact" style={{ flex: 1 }}>
-                      <span>{t("localDownloadDir")}</span>
-                      <input value={directory} onChange={(event) => setDirectory(event.target.value)} />
-                    </label>
-                    <button className="icon-button" onClick={pickDirectory} title={t("chooseDirectory")} style={{ marginTop: "24px" }}>
-                      <FolderOpen size={18} />
-                    </button>
-                  </div>
-                ) : null}
+                <div className="directory-row">
+                  <label className="field compact" style={{ flex: 1 }}>
+                    <span>{t("localDownloadDir")}</span>
+                    <input value={directory} onChange={(event) => setDirectory(event.target.value)} />
+                  </label>
+                  <button className="icon-button" onClick={pickDirectory} title={t("chooseDirectory")} style={{ marginTop: "24px" }}>
+                    <FolderOpen size={18} />
+                  </button>
+                </div>
 
                 <div className="number-grid">
                   <label className="field compact">
@@ -1203,17 +1195,6 @@ function App() {
                 <div className="command-preview">
                   <Terminal size={18} />
                   <code>{commandPreview}</code>
-                </div>
-
-                <div className="action-row">
-                  <button className="primary-button" onClick={startDownload} disabled={busy || running}>
-                    <Play size={17} />
-                    {t("startDownloadTask")}
-                  </button>
-                  <button className="danger-button" onClick={cancelDownload} disabled={!running}>
-                    <Square size={16} />
-                    {t("stopCurrentTask")}
-                  </button>
                 </div>
               </section>
             </div>
