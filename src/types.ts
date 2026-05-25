@@ -1,4 +1,5 @@
-export type SourceMode = "links" | "json" | "raw" | "chat" | "tgLite";
+export type SourceMode = "links" | "json" | "raw" | "chat";
+export type AppLanguage = "zh" | "en";
 
 export type DownloadStatus =
   | "downloading"
@@ -12,8 +13,11 @@ export interface AppConfig {
   threads: number;
   pool: number;
   tdlOverridePath?: string | null;
-  tgLiteApiId?: string;
-  tgLiteApiHash?: string;
+  language?: AppLanguage;
+  logDirectory?: string;
+  desktopUpdateUrl?: string;
+  tdlNamespace?: string;
+  tdlStorage?: string;
 }
 
 export interface TdlInfo {
@@ -128,36 +132,6 @@ export interface ChatMediaPreviewFile {
   size?: number | null;
 }
 
-export interface TgLiteStatus {
-  configured: boolean;
-  initialized: boolean;
-  authorized: boolean;
-  state: string;
-  message: string;
-  qrLink?: string | null;
-  username?: string | null;
-  displayName?: string | null;
-}
-
-export interface TgLiteChat {
-  id: number;
-  title: string;
-  chatType: string;
-  unreadCount: number;
-  lastMessageId?: number | null;
-  lastMessageText?: string | null;
-  order?: string | null;
-}
-
-export type TgLiteEvent =
-  | { kind: "status"; status: TgLiteStatus }
-  | { kind: "connection"; state: string }
-  | { kind: "chatUpsert"; chat: TgLiteChat }
-  | { kind: "chatDelete"; chatId: number }
-  | { kind: "messageNew"; chatId: number; message: MessageInfo }
-  | { kind: "messageUpdate"; chatId: number; messageId: number; message?: MessageInfo | null }
-  | { kind: "messageDelete"; chatId: number; messageIds: number[] };
-
 export interface DownloadStarted {
   taskId: string;
   commandPreview: string;
@@ -222,5 +196,20 @@ export type TdlUpdateStatus = "completed" | "failed";
 export interface TdlUpdateEvent {
   status: TdlUpdateStatus;
   tdl?: TdlInfo | null;
+  message: string;
+}
+
+export interface LogPackageInfo {
+  path: string;
+  fileName: string;
+  size: number;
+  message: string;
+}
+
+export interface DesktopUpdateStatus {
+  configured: boolean;
+  updateAvailable: boolean;
+  currentVersion: string;
+  latestVersion?: string | null;
   message: string;
 }
