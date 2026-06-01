@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use sha2::{Digest, Sha256};
 use tauri::{path::BaseDirectory, AppHandle, Manager};
 
 use crate::{
@@ -81,6 +82,7 @@ pub fn update_tdl(app: &AppHandle, state: &AppState) -> Result<TdlInfo, String> 
         .find(|asset| asset.name == asset_name)
         .ok_or_else(|| format!("未找到适配当前架构的 tdl 包: {asset_name}"))?;
 
+    let expected_digest = expected_sha256(&asset)?;
     let bytes = client
         .get(asset.browser_download_url)
         .send()
@@ -89,6 +91,7 @@ pub fn update_tdl(app: &AppHandle, state: &AppState) -> Result<TdlInfo, String> 
         .map_err(|error| format!("下载 tdl 失败: {error}"))?
         .bytes()
         .map_err(|error| format!("读取 tdl 下载内容失败: {error}"))?;
+    verify_sha256(bytes.as_ref(), &expected_digest, &asset.name)?;
 
     // 持有 running 锁直到替换完成，避免在替换 tdl.exe 时被新启动的下载任务占用。
     let running = lock(&state.running)?;
@@ -245,6 +248,35 @@ fn windows_asset_name() -> String {
         _ => "64bit",
     };
     format!("tdl_Windows_{suffix}.zip")
+}
+
+fn expected_sha256(asset: &crate::types::GitHubAsset) -> Result<String, String> {
+    let digest = asset
+        .digest
+        .as_deref()
+        .ok_or_else(|| format!("tdl 发布资产 {} 未提供 SHA-256 摘要。", asset.name))?;
+    let value = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| format!("tdl 发布资产 {} 的摘要不是 SHA-256。", asset.name))?
+        .trim()
+        .to_ascii_lowercase();
+    if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!(
+            "tdl 发布资产 {} 的 SHA-256 摘要格式无效。",
+            asset.name
+        ));
+    }
+    Ok(value)
+}
+
+fn verify_sha256(data: &[u8], expected: &str, label: &str) -> Result<(), String> {
+    let actual = format!("{:x}", Sha256::digest(data));
+    if actual != expected {
+        return Err(format!(
+            "tdl 下载包 SHA-256 校验失败 ({label})。期望 {expected}，实际 {actual}。"
+        ));
+    }
+    Ok(())
 }
 
 fn extract_tdl_exe(data: &[u8], destination: &Path) -> Result<(), String> {

@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, basename, join, resolve } from "node:path";
@@ -43,6 +44,26 @@ function findFile(dir, fileName) {
     }
   }
   return null;
+}
+
+function expectedSha256(asset) {
+  const digest = asset.digest;
+  if (typeof digest !== "string" || !digest.startsWith("sha256:")) {
+    throw new Error(`Release asset ${asset.name} does not provide a SHA-256 digest`);
+  }
+  const value = digest.slice("sha256:".length).trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error(`Release asset ${asset.name} has an invalid SHA-256 digest`);
+  }
+  return value;
+}
+
+function verifySha256(buffer, expected, label) {
+  const actual = createHash("sha256").update(buffer).digest("hex");
+  if (actual !== expected) {
+    throw new Error(`SHA-256 mismatch for ${label}: expected ${expected}, got ${actual}`);
+  }
+  console.log(`Verified SHA-256 for ${label}: ${actual}`);
 }
 
 if (existsSync(outFile) && statSync(outFile).size > 0 && !process.env.FORCE_TDL_DOWNLOAD) {
@@ -90,6 +111,7 @@ if (!asset) {
   throw new Error(`Asset not found: ${wanted}. Available: ${available}`);
 }
 
+const expectedDigest = expectedSha256(asset);
 console.log(`Downloading ${wanted}...`);
 const archiveResp = await fetch(asset.browser_download_url, {
   headers: { "User-Agent": "TDL-Desktop" },
@@ -99,11 +121,14 @@ if (!archiveResp.ok) {
   throw new Error(`Failed to download ${wanted}: ${archiveResp.status} ${archiveResp.statusText}`);
 }
 
+const archiveBuffer = Buffer.from(await archiveResp.arrayBuffer());
+verifySha256(archiveBuffer, expectedDigest, wanted);
+
 const tempDir = join(tmpdir(), `tdl-desktop-${Date.now()}`);
 const archivePath = join(tempDir, basename(wanted));
 const extractDir = join(tempDir, "extract");
 mkdirSync(extractDir, { recursive: true });
-writeFileSync(archivePath, Buffer.from(await archiveResp.arrayBuffer()));
+writeFileSync(archivePath, archiveBuffer);
 
 execFileSync(
   "powershell.exe",

@@ -345,4 +345,5 @@ pub struct GitHubRelease {
 pub struct GitHubAsset {
     pub name: String,
     pub browser_download_url: String,
+    pub digest: Option<String>,
 }
