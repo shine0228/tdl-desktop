@@ -2,6 +2,11 @@
 node_modules/
 build/
 dist/
+coverage/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
