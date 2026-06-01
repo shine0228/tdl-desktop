@@ -17,10 +17,81 @@ use crate::{
         DownloadEvent, DownloadEventKind, DownloadFileProgress, DownloadRecord, DownloadRequest,
         DownloadStatus, SourceMode,
     },
-    util::{parse_progress, strip_ansi, write_json},
+    util::{parse_progress, strip_ansi, write_json, TdlDatabaseGuard},
 };
 
 const OUTPUT_THROTTLE_INTERVAL: Duration = Duration::from_millis(180);
+
+pub struct ChildProcessGuard {
+    child: Arc<Mutex<Child>>,
+    armed: bool,
+}
+
+impl ChildProcessGuard {
+    pub fn new(child: Arc<Mutex<Child>>) -> Self {
+        Self { child, armed: true }
+    }
+
+    pub fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ChildProcessGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.child.lock() {
+            Ok(mut child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Err(_) => {
+                eprintln!("[download] child process lock poisoned while cleaning up failed start")
+            }
+        }
+    }
+}
+
+pub struct PendingHistoryGuard {
+    state: StateRefs,
+    record_ids: Vec<String>,
+    armed: bool,
+}
+
+impl PendingHistoryGuard {
+    pub fn new(state: StateRefs, record_ids: Vec<String>) -> Self {
+        Self {
+            state,
+            record_ids,
+            armed: true,
+        }
+    }
+
+    pub fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingHistoryGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.state.history.lock() {
+            Ok(mut history) => {
+                history.retain(|record| !self.record_ids.contains(&record.id));
+                if let Err(error) = write_json(&self.state.history_path, &*history) {
+                    eprintln!("[download] failed to rollback pending history records: {error}");
+                }
+            }
+            Err(_) => {
+                eprintln!("[download] history-state lock poisoned while rolling back failed start")
+            }
+        }
+    }
+}
 
 pub fn build_records(
     state: &AppState,
@@ -208,7 +279,7 @@ where
 
         loop {
             let buf = match reader.fill_buf() {
-                Ok(slice) if slice.is_empty() => break,
+                Ok([]) => break,
                 Ok(slice) => slice,
                 Err(error) => {
                     emit_line(
@@ -353,8 +424,17 @@ pub fn spawn_process_monitor(
     task_id: String,
     record_ids: Vec<String>,
     child: Arc<Mutex<Child>>,
+    database_guard: TdlDatabaseGuard,
 ) {
-    spawn_process_monitor_with_cleanup(app, state, task_id, record_ids, child, None);
+    spawn_process_monitor_with_cleanup(
+        app,
+        state,
+        task_id,
+        record_ids,
+        child,
+        None,
+        database_guard,
+    );
 }
 
 pub fn spawn_process_monitor_with_cleanup(
@@ -364,8 +444,10 @@ pub fn spawn_process_monitor_with_cleanup(
     record_ids: Vec<String>,
     child: Arc<Mutex<Child>>,
     cleanup_file: Option<PathBuf>,
+    database_guard: TdlDatabaseGuard,
 ) {
     thread::spawn(move || {
+        let _database_guard = database_guard;
         let exit_code = loop {
             let status = {
                 let mut child = match child.lock() {

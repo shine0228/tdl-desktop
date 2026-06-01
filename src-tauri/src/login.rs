@@ -20,7 +20,10 @@ use crate::{
         AppConfig, LoginEvent, LoginEventKind, LoginMethod, LoginRequest, LoginResultStatus,
         LoginStarted, LoginStatus, LoginStatusRequest,
     },
-    util::{apply_hidden_process_flags, lock, run_with_timeout, strip_ansi},
+    util::{
+        apply_hidden_process_flags, lock, run_with_timeout, strip_ansi, tdl_database_guard,
+        tdl_database_guard_for_quick_task, TdlDatabaseGuard,
+    },
 };
 
 const LOGIN_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -97,6 +100,7 @@ fn check_login_status_with_tdl(
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
 
+    let _database_guard = tdl_database_guard_for_quick_task()?;
     let output = match run_with_timeout(command, LOGIN_CHECK_TIMEOUT) {
         Ok(output) => output,
         Err(error) => {
@@ -173,6 +177,7 @@ pub fn start_login(
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
 
+    let database_guard = tdl_database_guard()?;
     let mut child = command
         .spawn()
         .map_err(|error| format!("启动 tdl 登录失败: {error}"))?;
@@ -193,7 +198,7 @@ pub fn start_login(
     if let Some(stream) = stderr {
         spawn_login_reader(app.clone(), login_id.clone(), stream, qr_lines);
     }
-    spawn_login_monitor(app, state.inner(), login_id.clone(), child);
+    spawn_login_monitor(app, state.inner(), login_id.clone(), child, database_guard);
 
     Ok(LoginStarted {
         login_id,
@@ -223,6 +228,7 @@ pub fn logout(state: State<'_, AppState>) -> Result<LoginStatus, String> {
     }
 
     let config = lock(&state.config)?.clone();
+    let _database_guard = tdl_database_guard_for_quick_task()?;
     let targets = session_targets(&config)?;
     remove_if_exists(&targets.namespace_dir)?;
     for legacy_file in targets.legacy_files {
@@ -348,7 +354,7 @@ fn spawn_login_reader<R>(
 
         loop {
             let buf = match reader.fill_buf() {
-                Ok(slice) if slice.is_empty() => break,
+                Ok([]) => break,
                 Ok(slice) => slice,
                 Err(error) => {
                     emit_login_output(&app, &login_id, format!("读取 tdl 登录输出失败: {error}"));
@@ -459,10 +465,12 @@ fn spawn_login_monitor(
     state: &AppState,
     login_id: String,
     child: Arc<Mutex<std::process::Child>>,
+    database_guard: TdlDatabaseGuard,
 ) {
     let login = Arc::clone(&state.login);
     let login_cancelled = Arc::clone(&state.login_cancelled);
     thread::spawn(move || {
+        let _database_guard = database_guard;
         let exit_code = loop {
             let status = {
                 let mut child = match child.lock() {

@@ -5,7 +5,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -16,7 +16,10 @@ use tauri::{path::BaseDirectory, AppHandle, Manager, State};
 
 use crate::{
     commands::OperationGuard,
-    download::{spawn_output_reader, spawn_process_monitor_with_cleanup},
+    download::{
+        spawn_output_reader, spawn_process_monitor_with_cleanup, ChildProcessGuard,
+        PendingHistoryGuard,
+    },
     state::AppState,
     tdl::resolve_tdl,
     tdl_config::prepend_tdl_global_args,
@@ -25,15 +28,14 @@ use crate::{
         DownloadRecord, DownloadStarted, DownloadStatus, MediaKind, MessageInfo, SourceMode,
     },
     util::{
-        apply_hidden_process_flags, lock, preview_command, run_with_timeout, validate_download_dir,
+        apply_hidden_process_flags, lock, preview_command, run_with_timeout, tdl_database_guard,
+        tdl_database_guard_for_quick_task, validate_download_dir,
     },
 };
 
 const CHAT_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 const CHAT_EXPORT_TIMEOUT: Duration = Duration::from_secs(90);
 const MEDIA_PREVIEW_TIMEOUT: Duration = Duration::from_secs(600);
-
-static TDL_DATABASE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone)]
 struct PreviewContext {
@@ -78,7 +80,7 @@ pub async fn list_chats(
                 "json".to_string(),
             ],
         );
-        let _guard = tdl_database_guard()?;
+        let _guard = tdl_database_guard_for_quick_task()?;
         let output = run_tdl_with_timeout(&tdl_path, &args, CHAT_LIST_TIMEOUT)?;
         let value: Value = serde_json::from_slice(&output.stdout)
             .map_err(|error| format!("解析对话列表失败: {error}"))?;
@@ -126,7 +128,7 @@ pub fn export_chat_messages(
     );
 
     let result = (|| {
-        let _guard = tdl_database_guard()?;
+        let _guard = tdl_database_guard_for_quick_task()?;
         run_tdl_with_timeout(&tdl_path, &args, CHAT_EXPORT_TIMEOUT)?;
         parse_messages_file(&output_path)
     })();
@@ -165,19 +167,6 @@ pub fn download_from_chat(
         &config,
         build_chat_download_args(&request, &directory, &export_path),
     );
-    let mut command = Command::new(&tdl_path);
-    apply_hidden_process_flags(&mut command);
-    command
-        .args(&download_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
-
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("启动 tdl 下载失败: {error}"))?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
     let task_id = state.next_id("task");
     let created_at = Utc::now().to_rfc3339();
     let records = vec![DownloadRecord {
@@ -198,8 +187,24 @@ pub fn download_from_chat(
         history.splice(0..0, records.clone());
         state.persist_history(&history)?;
     }
+    let history_guard = PendingHistoryGuard::new(state.refs(), record_ids.clone());
 
+    let mut command = Command::new(&tdl_path);
+    apply_hidden_process_flags(&mut command);
+    command
+        .args(&download_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+
+    let database_guard = tdl_database_guard()?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("启动 tdl 下载失败: {error}"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
     let child = Arc::new(Mutex::new(child));
+    let child_guard = ChildProcessGuard::new(Arc::clone(&child));
     lock(&state.running)?.insert(task_id.clone(), Arc::clone(&child));
     drop(operation_guard);
 
@@ -217,7 +222,10 @@ pub fn download_from_chat(
         record_ids,
         child,
         Some(export_path),
+        database_guard,
     );
+    child_guard.disarm();
+    history_guard.disarm();
 
     Ok(DownloadStarted {
         task_id,
@@ -294,7 +302,7 @@ fn preview_chat_media_blocking(
         );
 
         let result = (|| {
-            let _guard = tdl_database_guard()?;
+            let _guard = tdl_database_guard_for_quick_task()?;
             run_tdl_with_timeout_for_generation(
                 &tdl_path,
                 &args,
@@ -424,13 +432,6 @@ fn find_tdl_in_path() -> Option<PathBuf> {
     }
 
     None
-}
-
-fn tdl_database_guard() -> Result<std::sync::MutexGuard<'static, ()>, String> {
-    TDL_DATABASE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| "tdl 数据库访问锁已损坏。".to_string())
 }
 
 fn run_tdl_with_timeout(
@@ -699,7 +700,7 @@ fn export_exact_messages_with_output(
     );
 
     {
-        let _guard = tdl_database_guard()?;
+        let _guard = tdl_database_guard_for_quick_task()?;
         if let Some((generation_source, expected_generation)) = generation {
             run_tdl_with_timeout_for_generation(
                 tdl_path,
@@ -979,7 +980,11 @@ fn find_file_name(value: &Value) -> Option<String> {
         .or_else(|| find_file_name_inner(value, NESTED_KEYS, false))
 }
 
-fn find_file_name_inner(value: &Value, keys: &[&str], allow_current_file_key: bool) -> Option<String> {
+fn find_file_name_inner(
+    value: &Value,
+    keys: &[&str],
+    allow_current_file_key: bool,
+) -> Option<String> {
     match value {
         Value::Object(map) => {
             for key in keys {

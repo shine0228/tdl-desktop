@@ -14,7 +14,7 @@ use crate::{
     tdl::resolve_tdl,
     tdl_config::prepend_tdl_global_args,
     types::LinkPreview,
-    util::{apply_hidden_process_flags, lock, run_with_timeout},
+    util::{apply_hidden_process_flags, lock, run_with_timeout, tdl_database_guard_for_quick_task},
 };
 
 const PREVIEW_TIMEOUT: Duration = Duration::from_secs(25);
@@ -71,6 +71,7 @@ pub fn preview_link(
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
 
+    let _database_guard = tdl_database_guard_for_quick_task()?;
     let output = run_with_timeout(command, PREVIEW_TIMEOUT)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

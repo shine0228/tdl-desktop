@@ -9,7 +9,10 @@ use chrono::Utc;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
-    download::{build_download_args, build_records, spawn_output_reader, spawn_process_monitor},
+    download::{
+        build_download_args, build_records, spawn_output_reader, spawn_process_monitor,
+        ChildProcessGuard, PendingHistoryGuard,
+    },
     state::AppState,
     tdl::{resolve_tdl, update_tdl as update_tdl_impl},
     tdl_config::{add_missing_raw_global_args, prepend_tdl_global_args},
@@ -17,7 +20,10 @@ use crate::{
         AppConfig, AppSnapshot, DesktopUpdateStatus, DownloadRequest, DownloadStarted,
         LogPackageInfo, SourceMode, TdlInfo, TdlUpdateEvent, TdlUpdateStatus,
     },
-    util::{apply_hidden_process_flags, lock, preview_command, validate_download_dir},
+    util::{
+        apply_hidden_process_flags, lock, preview_command, tdl_database_guard,
+        validate_download_dir,
+    },
 };
 
 #[tauri::command]
@@ -120,20 +126,6 @@ pub fn start_download(
         fs::create_dir_all(&directory).map_err(|error| format!("无法创建下载目录: {error}"))?;
     }
 
-    let mut command = Command::new(&tdl_path);
-    apply_hidden_process_flags(&mut command);
-    command
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
-
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("启动 tdl 失败: {error}"))?;
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
     let task_id = state.next_id("task");
     let created_at = Utc::now().to_rfc3339();
     let records = build_records(&state, &request, &task_id, &created_at)?;
@@ -144,8 +136,25 @@ pub fn start_download(
         history.splice(0..0, records.clone());
         state.persist_history(&history)?;
     }
+    let history_guard = PendingHistoryGuard::new(state.refs(), record_ids.clone());
 
+    let mut command = Command::new(&tdl_path);
+    apply_hidden_process_flags(&mut command);
+    command
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+
+    let database_guard = tdl_database_guard()?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("启动 tdl 失败: {error}"))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
     let child = Arc::new(Mutex::new(child));
+    let child_guard = ChildProcessGuard::new(Arc::clone(&child));
     lock(&state.running)?.insert(task_id.clone(), Arc::clone(&child));
     drop(operation_guard);
 
@@ -156,7 +165,16 @@ pub fn start_download(
         spawn_output_reader(app.clone(), task_id.clone(), stream);
     }
 
-    spawn_process_monitor(app, state.refs(), task_id.clone(), record_ids, child);
+    spawn_process_monitor(
+        app,
+        state.refs(),
+        task_id.clone(),
+        record_ids,
+        child,
+        database_guard,
+    );
+    child_guard.disarm();
+    history_guard.disarm();
 
     Ok(DownloadStarted {
         task_id,

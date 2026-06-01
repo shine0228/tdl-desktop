@@ -2,7 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -49,6 +49,93 @@ where
 
 pub fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
     mutex.lock().map_err(|_| "内部状态锁已损坏".to_string())
+}
+
+pub fn tdl_database_guard() -> Result<TdlDatabaseGuard, String> {
+    acquire_tdl_database_guard(None, "tdl 正在执行其他任务，请稍后再试。")
+}
+
+pub fn tdl_database_guard_with_timeout(
+    timeout: Duration,
+    busy_message: &str,
+) -> Result<TdlDatabaseGuard, String> {
+    acquire_tdl_database_guard(Some(timeout), busy_message)
+}
+
+pub fn tdl_database_guard_for_quick_task() -> Result<TdlDatabaseGuard, String> {
+    tdl_database_guard_with_timeout(
+        Duration::from_secs(2),
+        "tdl 正在执行下载、登录或预览任务，请稍后再试。",
+    )
+}
+
+fn acquire_tdl_database_guard(
+    timeout: Option<Duration>,
+    busy_message: &str,
+) -> Result<TdlDatabaseGuard, String> {
+    let gate = TDL_DATABASE_LOCK
+        .get_or_init(|| Arc::new(TdlDatabaseGate::default()))
+        .clone();
+    {
+        let mut locked = gate
+            .locked
+            .lock()
+            .map_err(|_| "tdl 数据库访问锁已损坏。".to_string())?;
+        match timeout {
+            Some(timeout) => {
+                let started = Instant::now();
+                let mut remaining = timeout;
+                while *locked {
+                    let (next_locked, wait_result) = gate
+                        .released
+                        .wait_timeout(locked, remaining)
+                        .map_err(|_| "tdl 数据库访问锁已损坏。".to_string())?;
+                    locked = next_locked;
+                    if !*locked {
+                        break;
+                    }
+                    if wait_result.timed_out() || started.elapsed() >= timeout {
+                        return Err(busy_message.to_string());
+                    }
+                    remaining = timeout.saturating_sub(started.elapsed());
+                }
+            }
+            None => {
+                while *locked {
+                    locked = gate
+                        .released
+                        .wait(locked)
+                        .map_err(|_| "tdl 数据库访问锁已损坏。".to_string())?;
+                }
+            }
+        }
+        *locked = true;
+    }
+    Ok(TdlDatabaseGuard { gate })
+}
+
+static TDL_DATABASE_LOCK: OnceLock<Arc<TdlDatabaseGate>> = OnceLock::new();
+
+#[derive(Default)]
+struct TdlDatabaseGate {
+    locked: Mutex<bool>,
+    released: Condvar,
+}
+
+pub struct TdlDatabaseGuard {
+    gate: Arc<TdlDatabaseGate>,
+}
+
+impl Drop for TdlDatabaseGuard {
+    fn drop(&mut self) {
+        match self.gate.locked.lock() {
+            Ok(mut locked) => {
+                *locked = false;
+                self.gate.released.notify_one();
+            }
+            Err(_) => eprintln!("[tdl] database lock poisoned while releasing guard"),
+        }
+    }
 }
 
 pub fn default_download_dir() -> Result<PathBuf, String> {
