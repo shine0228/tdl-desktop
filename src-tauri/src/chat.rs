@@ -406,12 +406,24 @@ fn bundled_tdl_path(app: &AppHandle) -> Option<PathBuf> {
         .resolve("resources/tdl.exe", BaseDirectory::Resource)
         .ok();
 
-    resource.filter(|path| path.is_file()).or_else(|| {
-        let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join("tdl.exe");
-        dev_path.is_file().then_some(dev_path)
-    })
+    resource
+        .filter(|path| path.is_file())
+        .or_else(portable_tdl_path)
+        .or_else(|| {
+            let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources")
+                .join("tdl.exe");
+            dev_path.is_file().then_some(dev_path)
+        })
+}
+
+fn portable_tdl_path() -> Option<PathBuf> {
+    let path = env::current_exe()
+        .ok()?
+        .parent()?
+        .join("resources")
+        .join("tdl.exe");
+    path.is_file().then_some(path)
 }
 
 fn find_tdl_in_path() -> Option<PathBuf> {
