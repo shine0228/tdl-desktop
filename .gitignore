@@ -24,9 +24,17 @@ release/
 
 # Local app data / test output
 .claude/
+.tdl-desktop/
+**/.tdl-desktop/
 test-download/
 output/
 .playwright-cli/
+*.session
+*.db
+*.sqlite
+*.sqlite3
+*.kv
+*.tdl
 
 # OS / IDE
 .DS_Store
