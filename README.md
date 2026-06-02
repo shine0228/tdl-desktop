@@ -21,7 +21,6 @@ TDL Desktop 是基于 Tauri + React 的 Telegram 下载客户端，底层调用 
 ├── src-tauri/           # Tauri/Rust 后端和打包配置
 ├── scripts/             # 构建辅助脚本
 ├── public/              # 前端静态资源
-├── release/             # 本地发版产物，不提交 Git
 ├── build.bat            # 发布构建入口
 └── run.bat              # 开发运行入口
 ```
