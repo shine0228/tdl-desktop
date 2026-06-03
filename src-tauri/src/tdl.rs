@@ -15,9 +15,7 @@ use crate::{
     util::{apply_hidden_process_flags, lock},
 };
 
-const TDL_RELEASE_SOURCES: &[&str] = &[
-    "https://api.github.com/repos/iyear/tdl/releases/latest",
-];
+const TDL_RELEASE_SOURCES: &[&str] = &["https://api.github.com/repos/iyear/tdl/releases/latest"];
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 
