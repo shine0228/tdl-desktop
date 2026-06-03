@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, Read},
     path::PathBuf,
@@ -346,15 +347,17 @@ fn flush_line_inner(
 
 #[derive(Debug)]
 struct OutputThrottle {
-    last_emit: Instant,
-    emitted_any_progress: bool,
+    generic_last_emit: Instant,
+    emitted_any_generic_progress: bool,
+    file_last_emit: HashMap<String, Instant>,
 }
 
 impl Default for OutputThrottle {
     fn default() -> Self {
         Self {
-            last_emit: Instant::now() - OUTPUT_THROTTLE_INTERVAL,
-            emitted_any_progress: false,
+            generic_last_emit: Instant::now() - OUTPUT_THROTTLE_INTERVAL,
+            emitted_any_generic_progress: false,
+            file_last_emit: HashMap::new(),
         }
     }
 }
@@ -373,23 +376,42 @@ impl OutputThrottle {
         if progress.is_none() && file_progress.is_none() {
             return true;
         }
-        let done = progress.is_some_and(|value| value >= 99.9)
-            || file_progress.is_some_and(|value| value.done || value.progress >= 99.9);
+
         let now = Instant::now();
-        if !self.emitted_any_progress
+        if let Some(file_progress) = file_progress {
+            let done = file_progress.done || file_progress.progress >= 99.9;
+            let should_emit = done
+                || self
+                    .file_last_emit
+                    .get(&file_progress.key)
+                    .map(|last_emit| now.duration_since(*last_emit) >= OUTPUT_THROTTLE_INTERVAL)
+                    .unwrap_or(true);
+            if should_emit {
+                self.record_emit(progress, Some(file_progress));
+                return true;
+            }
+            return false;
+        }
+
+        let done = progress.is_some_and(|value| value >= 99.9);
+        if !self.emitted_any_generic_progress
             || done
-            || now.duration_since(self.last_emit) >= OUTPUT_THROTTLE_INTERVAL
+            || now.duration_since(self.generic_last_emit) >= OUTPUT_THROTTLE_INTERVAL
         {
-            self.record_emit(progress, file_progress);
+            self.record_emit(progress, None);
             return true;
         }
         false
     }
 
     fn record_emit(&mut self, progress: Option<f64>, file_progress: Option<&DownloadFileProgress>) {
-        if progress.is_some() || file_progress.is_some() {
-            self.emitted_any_progress = true;
-            self.last_emit = Instant::now();
+        let now = Instant::now();
+        if progress.is_some() && file_progress.is_none() {
+            self.emitted_any_generic_progress = true;
+            self.generic_last_emit = now;
+        }
+        if let Some(file_progress) = file_progress {
+            self.file_last_emit.insert(file_progress.key.clone(), now);
         }
     }
 }
@@ -536,28 +558,31 @@ pub fn spawn_process_monitor_with_cleanup(
 }
 
 fn parse_file_progress(line: &str) -> Option<DownloadFileProgress> {
-    let (span, progress) = last_percent_span(line)?;
-    let name = clean_progress_label(&line[..span.start]);
-    if name.is_empty() || is_generic_progress_label(&name) {
-        return None;
+    for (span, progress) in percent_spans(line) {
+        let name = clean_progress_label(&line[..span.start]);
+        if name.is_empty() || is_generic_progress_label(&name) {
+            continue;
+        }
+
+        let key = progress_key(&name);
+        if key.is_empty() {
+            continue;
+        }
+
+        return Some(DownloadFileProgress {
+            key,
+            name,
+            progress: progress.clamp(0.0, 100.0),
+            done: progress >= 99.9 || line.to_ascii_lowercase().contains("done"),
+        });
     }
 
-    let key = progress_key(&name);
-    if key.is_empty() {
-        return None;
-    }
-
-    Some(DownloadFileProgress {
-        key,
-        name,
-        progress: progress.clamp(0.0, 100.0),
-        done: progress >= 99.9 || line.to_ascii_lowercase().contains("done"),
-    })
+    None
 }
 
-fn last_percent_span(line: &str) -> Option<(std::ops::Range<usize>, f64)> {
+fn percent_spans(line: &str) -> Vec<(std::ops::Range<usize>, f64)> {
     let bytes = line.as_bytes();
-    let mut last: Option<(std::ops::Range<usize>, f64)> = None;
+    let mut spans = Vec::new();
 
     for (idx, ch) in line.char_indices() {
         if ch != '%' {
@@ -576,11 +601,11 @@ fn last_percent_span(line: &str) -> Option<(std::ops::Range<usize>, f64)> {
             continue;
         }
         if let Ok(value) = line[start..idx].parse::<f64>() {
-            last = Some((start..idx, value));
+            spans.push((start..idx, value));
         }
     }
 
-    last
+    spans
 }
 
 fn clean_progress_label(prefix: &str) -> String {
@@ -592,13 +617,14 @@ fn clean_progress_label(prefix: &str) -> String {
         label = &label[..index];
     }
 
-    label
+    let label = label
         .trim_matches(|ch: char| {
             ch.is_whitespace()
                 || matches!(
                     ch,
                     '[' | ']'
                         | '|'
+                        | ':'
                         | '.'
                         | '#'
                         | '<'
@@ -622,13 +648,44 @@ fn clean_progress_label(prefix: &str) -> String {
         })
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+
+    strip_progress_status_prefixes(&label)
+}
+
+fn strip_progress_status_prefixes(label: &str) -> String {
+    let mut words = label.split_whitespace().collect::<Vec<_>>();
+    while words.len() > 1 && is_progress_status_word(words[0]) {
+        words.remove(0);
+    }
+    words.join(" ")
+}
+
+fn is_progress_status_word(word: &str) -> bool {
+    matches!(
+        word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+            .to_ascii_lowercase()
+            .as_str(),
+        "download" | "downloading" | "downloaded" | "progress" | "file" | "media"
+    )
 }
 
 fn is_generic_progress_label(label: &str) -> bool {
+    let normalized = progress_key(label);
     matches!(
-        label.to_ascii_lowercase().as_str(),
-        "download" | "downloading" | "progress" | "total" | "all"
+        normalized.as_str(),
+        "download"
+            | "downloading"
+            | "downloaded"
+            | "progress"
+            | "total"
+            | "all"
+            | "file"
+            | "media"
+            | "cpu"
+            | "mem"
+            | "memory"
+            | "ram"
     )
 }
 
@@ -725,5 +782,90 @@ mod tests {
     #[test]
     fn ignores_generic_progress_label() {
         assert!(parse_file_progress("downloading 12%").is_none());
+        assert!(parse_file_progress("total 73%").is_none());
+        assert!(parse_file_progress("CPU 12%").is_none());
+        assert!(parse_file_progress("Memory: 42%").is_none());
+        assert!(parse_file_progress("RAM 38%").is_none());
+    }
+
+    #[test]
+    fn parses_file_progress_before_total_progress() {
+        let progress = parse_file_progress("video.mp4 42% total 73%").unwrap();
+        assert_eq!(progress.name, "video.mp4");
+        assert_eq!(progress.progress, 42.0);
+    }
+
+    #[test]
+    fn strips_progress_status_prefix_from_file_label() {
+        let progress = parse_file_progress("Downloading video.mp4 [=====>] 42%").unwrap();
+        assert_eq!(progress.name, "video.mp4");
+        assert_eq!(progress.key, "video-mp4");
+    }
+
+    #[test]
+    fn distinct_file_progress_labels_get_distinct_keys() {
+        let first = parse_file_progress("first.mp4 12%").unwrap();
+        let second = parse_file_progress("second.mp4 12%").unwrap();
+        assert_ne!(first.key, second.key);
+    }
+
+    #[test]
+    fn throttle_emits_first_update_for_each_file_key() {
+        let mut throttle = OutputThrottle::default();
+        let first = DownloadFileProgress {
+            key: "first".into(),
+            name: "first.mp4".into(),
+            progress: 10.0,
+            done: false,
+        };
+        let second = DownloadFileProgress {
+            key: "second".into(),
+            name: "second.mp4".into(),
+            progress: 10.0,
+            done: false,
+        };
+
+        assert!(throttle.should_emit(Some(10.0), Some(&first), false));
+        assert!(throttle.should_emit(Some(10.0), Some(&second), false));
+    }
+
+    #[test]
+    fn throttle_suppresses_repeated_updates_for_same_file_key() {
+        let mut throttle = OutputThrottle::default();
+        let first = DownloadFileProgress {
+            key: "first".into(),
+            name: "first.mp4".into(),
+            progress: 10.0,
+            done: false,
+        };
+        let repeated = DownloadFileProgress {
+            key: "first".into(),
+            name: "first.mp4".into(),
+            progress: 12.0,
+            done: false,
+        };
+
+        assert!(throttle.should_emit(Some(10.0), Some(&first), false));
+        assert!(!throttle.should_emit(Some(12.0), Some(&repeated), false));
+    }
+
+    #[test]
+    fn throttle_always_emits_done_file_update() {
+        let mut throttle = OutputThrottle::default();
+        let first = DownloadFileProgress {
+            key: "first".into(),
+            name: "first.mp4".into(),
+            progress: 10.0,
+            done: false,
+        };
+        let done = DownloadFileProgress {
+            key: "first".into(),
+            name: "first.mp4".into(),
+            progress: 100.0,
+            done: true,
+        };
+
+        assert!(throttle.should_emit(Some(10.0), Some(&first), false));
+        assert!(throttle.should_emit(Some(100.0), Some(&done), false));
     }
 }

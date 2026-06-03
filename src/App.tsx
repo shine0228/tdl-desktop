@@ -436,10 +436,9 @@ function App() {
 
   function handleDownloadEvent(event: DownloadEvent) {
     if (event.kind === "output" && event.line) {
+      setLogs((current) => [...current.slice(-120), event.line as string]);
       if (event.fileProgress) {
         mergeFileProgress(event.fileProgress);
-      } else {
-        setLogs((current) => [...current.slice(-120), event.line as string]);
       }
       if (typeof event.progress === "number") {
         setProgress(Math.max(0, Math.min(100, event.progress)));

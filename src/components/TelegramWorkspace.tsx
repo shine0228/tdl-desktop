@@ -479,7 +479,7 @@ export function LinkPreviewPanel({ state, t }: { state: PreviewState; t: (key: T
             <strong>{t("readingMessageText")}</strong>
             <span>{state.link}</span>
           </div>
-          <p>{t("previewRequiresLogin")}</p>
+          <p className="link-preview-text">{t("previewRequiresLogin")}</p>
         </div>
       </div>
     );
@@ -496,7 +496,7 @@ export function LinkPreviewPanel({ state, t }: { state: PreviewState; t: (key: T
             <strong>{t("previewUnavailable")}</strong>
             <span>{state.link}</span>
           </div>
-          <p>{state.error}</p>
+          <p className="link-preview-text">{state.error}</p>
         </div>
       </div>
     );
@@ -515,7 +515,7 @@ export function LinkPreviewPanel({ state, t }: { state: PreviewState; t: (key: T
           <strong>@{preview.chat}/{preview.messageId}</strong>
           <span>{preview.mediaCount > 0 ? `${t("mediaFields")} ${preview.mediaCount}` : t("textPreview")}</span>
         </div>
-        <p>{text}</p>
+        <p className="link-preview-text">{text}</p>
       </div>
     </div>
   );
