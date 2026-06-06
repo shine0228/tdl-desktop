@@ -34,6 +34,7 @@ pub struct AppSnapshot {
     pub config: AppConfig,
     pub history: Vec<DownloadRecord>,
     pub tdl: TdlInfo,
+    pub desktop_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +130,8 @@ pub struct DownloadRecord {
     pub created_at: String,
     pub completed_at: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

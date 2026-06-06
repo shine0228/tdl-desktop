@@ -24,6 +24,7 @@ pub fn run() {
             commands::save_config,
             commands::pick_directory,
             commands::pick_log_directory,
+            commands::open_directory,
             commands::preview_download_command,
             commands::start_download,
             commands::cancel_download,

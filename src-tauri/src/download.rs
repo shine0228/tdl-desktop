@@ -122,6 +122,8 @@ pub fn build_records(
         SourceMode::Chat => return Err("对话模式请使用对话下载命令。".into()),
     };
 
+    let request_json = serde_json::to_value(request).ok();
+
     Ok(sources
         .into_iter()
         .map(|source| DownloadRecord {
@@ -134,6 +136,7 @@ pub fn build_records(
             created_at: created_at.to_string(),
             completed_at: None,
             error: None,
+            request: request_json.clone(),
         })
         .collect())
 }

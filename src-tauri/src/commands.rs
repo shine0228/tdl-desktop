@@ -45,6 +45,7 @@ pub fn get_app_state(app: AppHandle, state: State<'_, AppState>) -> Result<AppSn
         config,
         history,
         tdl,
+        desktop_version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
 
@@ -70,6 +71,43 @@ pub fn pick_log_directory() -> Option<String> {
     rfd::FileDialog::new()
         .pick_folder()
         .map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn open_directory(path: String) -> Result<(), String> {
+    let path_obj = std::path::Path::new(&path);
+    if !path_obj.exists() {
+        return Err(format!("目录不存在: {}", path));
+    }
+    if !path_obj.is_dir() {
+        return Err(format!("路径不是目录: {}", path));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&path)
+            .spawn()
+            .map_err(|error| format!("打开目录失败: {error}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|error| format!("打开目录失败: {error}"))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|error| format!("打开目录失败: {error}"))?;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]

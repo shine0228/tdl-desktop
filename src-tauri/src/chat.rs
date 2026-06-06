@@ -169,6 +169,7 @@ pub fn download_from_chat(
     );
     let task_id = state.next_id("task");
     let created_at = Utc::now().to_rfc3339();
+    let request_json = serde_json::to_value(&request).ok();
     let records = vec![DownloadRecord {
         id: state.next_id("record"),
         task_id: task_id.clone(),
@@ -179,6 +180,7 @@ pub fn download_from_chat(
         created_at,
         completed_at: None,
         error: None,
+        request: request_json,
     }];
     let record_ids: Vec<String> = records.iter().map(|record| record.id.clone()).collect();
 
