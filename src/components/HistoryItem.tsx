@@ -1,4 +1,4 @@
-import { AlertCircle, CheckCircle2, Download, XCircle } from "lucide-react";
+import { AlertCircle, CheckCircle2, Download, XCircle, FolderOpen, Copy, CornerDownLeft, RotateCcw, PlayCircle } from "lucide-react";
 
 import type { AppLanguage } from "../appTypes";
 import { formatDate, modeLabel, statusLabel } from "../appUtils";
@@ -9,10 +9,22 @@ export function HistoryItem({
   record,
   language,
   t,
+  onOpenDirectory,
+  onCopyError,
+  onCopySource,
+  onUseAsInput,
+  onRetry,
+  onContinue,
 }: {
   record: DownloadRecord;
   language: AppLanguage;
   t: (key: TranslationKey) => string;
+  onOpenDirectory?: (record: DownloadRecord) => void;
+  onCopyError?: (record: DownloadRecord) => void;
+  onCopySource?: (record: DownloadRecord) => void;
+  onUseAsInput?: (record: DownloadRecord) => void;
+  onRetry?: (record: DownloadRecord) => void;
+  onContinue?: (record: DownloadRecord) => void;
 }) {
   const Icon =
     record.status === "completed"
@@ -39,6 +51,74 @@ export function HistoryItem({
           <span>{formatDate(record.completedAt ?? record.createdAt, language)}</span>
         </div>
         {record.error ? <p>{record.error}</p> : null}
+        <div className="history-actions">
+          {onRetry && record.request && (
+            <button
+              type="button"
+              className="text-button"
+              onClick={() => onRetry(record)}
+              title={t("retryDownload")}
+            >
+              <RotateCcw size={14} />
+              {t("retryDownload")}
+            </button>
+          )}
+          {onContinue && record.request && (record.status === "failed" || record.status === "cancelled") && (
+            <button
+              type="button"
+              className="text-button"
+              onClick={() => onContinue(record)}
+              title={t("continueDownload")}
+            >
+              <PlayCircle size={14} />
+              {t("continueDownload")}
+            </button>
+          )}
+          {onOpenDirectory && record.directory && record.mode !== "raw" && (
+            <button
+              type="button"
+              className="text-button"
+              onClick={() => onOpenDirectory(record)}
+              title={t("openDirectory")}
+            >
+              <FolderOpen size={14} />
+              {t("openDirectory")}
+            </button>
+          )}
+          {onCopyError && record.error && (
+            <button
+              type="button"
+              className="text-button"
+              onClick={() => onCopyError(record)}
+              title={t("copyError")}
+            >
+              <Copy size={14} />
+              {t("copyError")}
+            </button>
+          )}
+          {onCopySource && (
+            <button
+              type="button"
+              className="text-button"
+              onClick={() => onCopySource(record)}
+              title={t("copySource")}
+            >
+              <Copy size={14} />
+              {t("copySource")}
+            </button>
+          )}
+          {onUseAsInput && (record.mode === "links" || record.mode === "json") && (
+            <button
+              type="button"
+              className="text-button"
+              onClick={() => onUseAsInput(record)}
+              title={t("useAsInput")}
+            >
+              <CornerDownLeft size={14} />
+              {t("useAsInput")}
+            </button>
+          )}
+        </div>
       </div>
     </article>
   );

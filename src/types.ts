@@ -45,12 +45,14 @@ export interface DownloadRecord {
   createdAt: string;
   completedAt?: string | null;
   error?: string | null;
+  request?: DownloadRequest | ChatDownloadRequest;
 }
 
 export interface AppState {
   config: AppConfig;
   history: DownloadRecord[];
   tdl: TdlInfo;
+  desktopVersion: string;
 }
 
 export interface DownloadRequest {

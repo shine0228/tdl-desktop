@@ -699,6 +699,20 @@ h2 {
   max-width: 120px; /* Constrain individual input width */
 }
 
+/* Parameter Presets */
+.parameter-presets {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 480px;
+}
+
+.parameter-presets > span {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
 /* Advanced Options */
 .advanced-toggle {
   align-self: flex-start;
@@ -794,6 +808,40 @@ h2 {
 }
 
 /* Activity & Progress */
+.completion-result {
+  padding: 16px 20px;
+  background: var(--accent-primary-light);
+  border: 1px solid var(--accent-primary);
+  border-radius: var(--radius-md);
+  margin: 0 20px 16px 20px;
+}
+
+.completion-result .section-header h2 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent-primary);
+  margin: 0;
+}
+
+.result-directory {
+  margin: 8px 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+.result-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.result-actions .ghost-button {
+  font-size: 12px;
+  padding: 6px 12px;
+}
+
 .activity-panel {
   padding: 20px;
 }
@@ -1010,6 +1058,21 @@ h2 {
 
 .history-icon.completed { color: var(--accent-primary); background: var(--accent-primary-light); }
 .history-icon.failed { color: var(--accent-danger); background: var(--accent-danger-light); }
+
+.history-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.history-actions .text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 4px 8px;
+}
 
 /* Workspace Shared */
 .chat-avatar {

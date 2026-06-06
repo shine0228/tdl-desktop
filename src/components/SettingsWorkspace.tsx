@@ -9,11 +9,16 @@ export function SettingsWorkspace({
   t,
   logPackage,
   desktopUpdateStatus,
+  desktopVersion,
   desktopUpdateChecking,
+  tdlUpdateChecking,
+  tdlUpdating,
   onSaveConfig,
   onPickLogDirectory,
   onCollectLogs,
   onCheckDesktopUpdate,
+  onCheckTdlUpdate,
+  onUpdateTdl,
   onClearCache,
 }: {
   config: AppConfig;
@@ -21,14 +26,20 @@ export function SettingsWorkspace({
   t: (key: TranslationKey) => string;
   logPackage: LogPackageInfo | null;
   desktopUpdateStatus: DesktopUpdateStatus | null;
+  desktopVersion: string;
   desktopUpdateChecking: boolean;
+  tdlUpdateChecking: boolean;
+  tdlUpdating: boolean;
   onSaveConfig: (next: AppConfig) => Promise<void>;
   onPickLogDirectory: () => void;
   onCollectLogs: () => void;
   onCheckDesktopUpdate: () => void;
+  onCheckTdlUpdate: () => void;
+  onUpdateTdl: () => void;
   onClearCache: () => void;
 }) {
   const language = config.language === "en" ? "en" : "zh";
+  const currentDesktopVersion = desktopUpdateStatus?.currentVersion || desktopVersion || t("notConfigured");
   return (
     <section className="settings-page">
       <div className="section-header">
@@ -71,6 +82,16 @@ export function SettingsWorkspace({
           <h3>{t("tdlInfo")}</h3>
           <div className="settings-kv"><span>{t("version")}</span><strong>{tdl?.version ?? t("notConfigured")}</strong></div>
           <div className="settings-kv"><span>{t("path")}</span><code>{tdl?.path ?? t("notConfigured")}</code></div>
+          <div className="action-row">
+            <button className="ghost-button" type="button" onClick={onCheckTdlUpdate} disabled={tdlUpdateChecking || tdlUpdating}>
+              <RotateCw size={16} />
+              {tdlUpdateChecking ? "..." : t("checkTdlUpdate")}
+            </button>
+            <button className="primary-button" type="button" onClick={onUpdateTdl} disabled={tdlUpdateChecking || tdlUpdating || !tdl?.available}>
+              <RotateCw size={16} />
+              {tdlUpdating ? t("updatingTdl") : t("updateTdl")}
+            </button>
+          </div>
           <label className="field compact">
             <span>{t("tdlNamespace")}</span>
             <input value={config.tdlNamespace || "default"} onChange={(event) => void onSaveConfig({ ...config, tdlNamespace: event.target.value })} />
@@ -93,7 +114,7 @@ export function SettingsWorkspace({
 
         <section className="settings-card">
           <h3>{t("desktopUpdate")}</h3>
-          <div className="settings-kv"><span>{t("currentVersion")}</span><strong>{desktopUpdateStatus?.currentVersion ?? "0.2.0"}</strong></div>
+          <div className="settings-kv"><span>{t("currentVersion")}</span><strong>{currentDesktopVersion}</strong></div>
           <button className="ghost-button" type="button" onClick={onCheckDesktopUpdate} disabled={desktopUpdateChecking}>
             <RotateCw size={16} />
             {desktopUpdateChecking ? "..." : t("checkDesktopUpdate")}

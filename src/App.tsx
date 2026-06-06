@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   Bot,
   ChevronDown,
+  Copy,
   File,
   FileJson,
   FolderOpen,
@@ -40,6 +41,7 @@ import type {
   DownloadRecord,
   DownloadRequest,
   DownloadStarted,
+  DownloadStatus,
   LoginEvent,
   LoginMethod,
   LoginStarted,
@@ -68,6 +70,19 @@ const DEFAULT_CONFIG: AppConfig = {
 
 const AUTO_CHAT_REFRESH_MS = 60_000;
 const AUTO_PREVIEW_CONCURRENCY = 1;
+
+const DOWNLOAD_PRESETS = [
+  { key: "stable", label: "presetStable", limit: 2, threads: 2, pool: 4 },
+  { key: "balanced", label: "presetBalanced", limit: 4, threads: 4, pool: 8 },
+  { key: "fast", label: "presetFast", limit: 8, threads: 8, pool: 16 },
+  { key: "max", label: "presetMax", limit: 16, threads: 16, pool: 32 },
+] as const satisfies ReadonlyArray<{
+  key: string;
+  label: TranslationKey;
+  limit: number;
+  threads: number;
+  pool: number;
+}>;
 
 function inTauri() {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
@@ -108,9 +123,11 @@ function buildLocalPreview(request: DownloadRequest, t: (key: TranslationKey) =>
     String(request.limit),
     "-t",
     String(request.threads),
-    "--pool",
-    String(request.pool),
   ];
+
+  if (request.pool > 0) {
+    args.push("--pool", String(request.pool));
+  }
 
   if (request.mode === "links") {
     request.links.forEach((link) => args.push("-u", quoteArg(link)));
@@ -191,10 +208,17 @@ function App() {
   const [message, setMessage] = useState<string>(TRANSLATIONS.zh.loading);
   const [busy, setBusy] = useState(false);
   const [tdlUpdateChecking, setTdlUpdateChecking] = useState(false);
+  const [tdlUpdating, setTdlUpdating] = useState(false);
   const [desktopUpdateChecking, setDesktopUpdateChecking] = useState(false);
   const [logPackage, setLogPackage] = useState<LogPackageInfo | null>(null);
   const [desktopUpdateStatus, setDesktopUpdateStatus] = useState<DesktopUpdateStatus | null>(null);
+  const [desktopVersion, setDesktopVersion] = useState("");
   const [fullMedia, setFullMedia] = useState<FullMedia | null>(null);
+  const [lastCompletedTask, setLastCompletedTask] = useState<{
+    recordIds: string[];
+    status: DownloadStatus;
+    directory: string;
+  } | null>(null);
 
   const language = config.language === "en" ? "en" : "zh";
   const t = useCallback((key: TranslationKey) => TRANSLATIONS[language][key], [language]);
@@ -403,6 +427,7 @@ function App() {
       setDirectory(state.config.lastDirectory);
       setHistory(state.history);
       setTdl(state.tdl);
+      setDesktopVersion(state.desktopVersion);
       setMessage(state.tdl.available ? t("ready") : t("tdlUnavailable"));
       if (state.tdl.available) {
         void refreshLoginStatus().then((status) => {
@@ -455,8 +480,8 @@ function App() {
         );
       }
       setMessage(event.message ?? "");
-      setHistory((current) =>
-        current.map((record) =>
+      setHistory((current) => {
+        const updated = current.map((record) =>
           event.recordIds.includes(record.id)
             ? {
                 ...record,
@@ -465,8 +490,20 @@ function App() {
                 error: event.error,
               }
             : record,
-        ),
-      );
+        );
+
+        // 保存最近完成任务信息用于结果操作区
+        const completedRecord = updated.find((r) => event.recordIds.includes(r.id));
+        if (completedRecord && event.status) {
+          setLastCompletedTask({
+            recordIds: event.recordIds,
+            status: event.status,
+            directory: completedRecord.directory,
+          });
+        }
+
+        return updated;
+      });
     }
   }
 
@@ -523,6 +560,7 @@ function App() {
 
   function handleTdlUpdateEvent(event: TdlUpdateEvent) {
     setTdlUpdateChecking(false);
+    setTdlUpdating(false);
     if (event.tdl) {
       setTdl(event.tdl);
     }
@@ -803,18 +841,6 @@ function App() {
     setMessage(t("cancelling"));
   }
 
-  async function checkTdlUpdate() {
-    if (!inTauri() || tdlUpdateChecking) return;
-    setTdlUpdateChecking(true);
-    setMessage(t("checkingTdlUpdate"));
-    try {
-      await invoke("update_tdl");
-    } catch (error) {
-      setTdlUpdateChecking(false);
-      setMessage(String(error));
-    }
-  }
-
   async function clearCache() {
     if (!window.confirm(t("clearCacheConfirm"))) return;
     previewGenerationRef.current += 1;
@@ -833,6 +859,33 @@ function App() {
       setMessage(t("cacheCleared"));
     } catch (error) {
       setMessage(`${t("cacheClearFailed")}: ${String(error)}`);
+    }
+  }
+
+  async function checkTdlUpdate() {
+    if (!inTauri() || tdlUpdateChecking) return;
+    setTdlUpdateChecking(true);
+    try {
+      const info = await invoke<TdlInfo>("refresh_tdl_info");
+      setTdl(info);
+      setMessage(t("tdlRefreshed"));
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setTdlUpdateChecking(false);
+    }
+  }
+
+  async function updateTdl() {
+    if (!inTauri() || tdlUpdating) return;
+    setTdlUpdating(true);
+    setMessage(t("updatingTdl"));
+    try {
+      await invoke("update_tdl");
+      // 实际更新结果通过 tdl-update-event 返回
+    } catch (error) {
+      setMessage(String(error));
+      setTdlUpdating(false);
     }
   }
 
@@ -928,6 +981,107 @@ function App() {
     }
     await invoke("clear_history");
     setHistory([]);
+  }
+
+  async function openRecordDirectory(record: DownloadRecord) {
+    if (!inTauri() || !record.directory) return;
+    try {
+      await invoke("open_directory", { path: record.directory });
+    } catch (error) {
+      setMessage(String(error));
+    }
+  }
+
+  async function copyRecordError(record: DownloadRecord) {
+    if (!record.error) return;
+    try {
+      await navigator.clipboard.writeText(record.error);
+      setMessage(t("copyError") + ": " + record.error.slice(0, 50));
+    } catch (error) {
+      setMessage(String(error));
+    }
+  }
+
+  async function copyRecordSource(record: DownloadRecord) {
+    try {
+      await navigator.clipboard.writeText(record.source);
+      setMessage(t("copySource") + ": " + record.source.slice(0, 50));
+    } catch (error) {
+      setMessage(String(error));
+    }
+  }
+
+  function useRecordAsInput(record: DownloadRecord) {
+    if (record.mode === "links") {
+      setMode("links");
+      setLinksText(record.source);
+      setDirectory(record.directory);
+      setMessage(t("useAsInput") + " - " + t("linkDownload"));
+    } else if (record.mode === "json") {
+      setMode("json");
+      setFilesText(record.source);
+      setDirectory(record.directory);
+      setMessage(t("useAsInput") + " - " + t("jsonImport"));
+    }
+  }
+
+  async function retryDownload(record: DownloadRecord) {
+    if (!inTauri() || !record.request) {
+      setMessage("无法重试：缺少原始请求参数");
+      return;
+    }
+
+    try {
+      setBusy(true);
+      const request = record.request as DownloadRequest | ChatDownloadRequest;
+
+      if (record.mode === "chat") {
+        const chatRequest = request as ChatDownloadRequest;
+        const result = await invoke<DownloadStarted>("download_from_chat", { request: chatRequest });
+        setRunningTaskId(result.taskId);
+        setHistory((current) => [...result.records, ...current]);
+        setMessage(t("startDownloadTask"));
+      } else {
+        const downloadRequest = request as DownloadRequest;
+        const result = await invoke<DownloadStarted>("start_download", { request: downloadRequest });
+        setRunningTaskId(result.taskId);
+        setHistory((current) => [...result.records, ...current]);
+        setMessage(t("startDownloadTask"));
+      }
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function continueDownload(record: DownloadRecord) {
+    if (!inTauri() || !record.request) {
+      setMessage("无法继续：缺少原始请求参数");
+      return;
+    }
+
+    try {
+      setBusy(true);
+      const request = record.request as DownloadRequest | ChatDownloadRequest;
+      const modifiedRequest = { ...request, continueLast: true, restart: false };
+
+      if (record.mode === "chat") {
+        const result = await invoke<DownloadStarted>("download_from_chat", { request: modifiedRequest });
+        setRunningTaskId(result.taskId);
+        setHistory((current) => [...result.records, ...current]);
+        setMessage(t("continueDownload"));
+      } else {
+        const result = await invoke<DownloadStarted>("start_download", { request: modifiedRequest });
+        setRunningTaskId(result.taskId);
+        setHistory((current) => [...result.records, ...current]);
+        setMessage(t("continueDownload"));
+      }
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setBusy(false);
+    }
   }
 
   const running = Boolean(runningTaskId);
@@ -1038,7 +1192,20 @@ function App() {
               </div>
               <div className="history-list">
                 {history.length ? (
-                  history.map((record) => <HistoryItem key={record.id} record={record} language={language} t={t} />)
+                  history.map((record) => (
+                    <HistoryItem
+                      key={record.id}
+                      record={record}
+                      language={language}
+                      t={t}
+                      onOpenDirectory={openRecordDirectory}
+                      onCopyError={copyRecordError}
+                      onCopySource={copyRecordSource}
+                      onUseAsInput={useRecordAsInput}
+                      onRetry={retryDownload}
+                      onContinue={continueDownload}
+                    />
+                  ))
                 ) : (
                   <div className="empty-state">
                     <ListChecks size={24} />
@@ -1056,11 +1223,16 @@ function App() {
               t={t}
               logPackage={logPackage}
               desktopUpdateStatus={desktopUpdateStatus}
+              desktopVersion={desktopVersion}
               desktopUpdateChecking={desktopUpdateChecking}
+              tdlUpdateChecking={tdlUpdateChecking}
+              tdlUpdating={tdlUpdating}
               onSaveConfig={saveConfig}
               onPickLogDirectory={() => void pickLogDirectory()}
               onCollectLogs={() => void collectLogs()}
               onCheckDesktopUpdate={() => void checkDesktopUpdate()}
+              onCheckTdlUpdate={() => void checkTdlUpdate()}
+              onUpdateTdl={() => void updateTdl()}
               onClearCache={() => void clearCache()}
             />
           ) : (
@@ -1117,6 +1289,33 @@ function App() {
                   <button className="icon-button" onClick={pickDirectory} title={t("chooseDirectory")} style={{ marginTop: "24px" }}>
                     <FolderOpen size={18} />
                   </button>
+                </div>
+
+                <div className="parameter-presets">
+                  <span>{t("downloadPresets")}</span>
+                  <div className="segmented">
+                    {DOWNLOAD_PRESETS.map((preset) => {
+                      const isActive =
+                        config.limit === preset.limit &&
+                        config.threads === preset.threads &&
+                        config.pool === preset.pool;
+                      return (
+                        <button
+                          key={preset.key}
+                          type="button"
+                          className={isActive ? "active" : ""}
+                          onClick={() =>
+                            void persistConfig(
+                              { ...config, limit: preset.limit, threads: preset.threads, pool: preset.pool },
+                              { immediate: true }
+                            )
+                          }
+                        >
+                          {t(preset.label)}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
 
                 <div className="number-grid">
@@ -1230,6 +1429,58 @@ function App() {
           onLogout={() => void logout()}
           t={t}
         />
+
+        {lastCompletedTask && (
+          <div className="completion-result">
+            <div className="section-header">
+              <h2>
+                {lastCompletedTask.status === "completed"
+                  ? t("downloadCompleted")
+                  : lastCompletedTask.status === "failed"
+                    ? t("downloadFailed")
+                    : t("downloadCancelled")}
+              </h2>
+            </div>
+            {lastCompletedTask.status === "completed" && lastCompletedTask.directory && (
+              <p className="result-directory">
+                <strong>{t("savedTo")}:</strong> {lastCompletedTask.directory}
+              </p>
+            )}
+            <div className="result-actions">
+              {lastCompletedTask.directory && (
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => openRecordDirectory({ directory: lastCompletedTask.directory } as DownloadRecord)}
+                >
+                  <FolderOpen size={16} />
+                  {t("openDirectory")}
+                </button>
+              )}
+              {lastCompletedTask.directory && (
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => copyRecordSource({ source: lastCompletedTask.directory } as DownloadRecord)}
+                >
+                  <Copy size={16} />
+                  {t("copyPath")}
+                </button>
+              )}
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => {
+                  setMode("history");
+                  setLastCompletedTask(null);
+                }}
+              >
+                <ListChecks size={16} />
+                {t("viewHistory")}
+              </button>
+            </div>
+          </div>
+        )}
 
         <div className="activity-panel">
           <div className="section-header">
