@@ -35,6 +35,71 @@ export interface LinkPreview {
   mediaCount: number;
 }
 
+export type ErrorCategory =
+  | "missingTdl"
+  | "tdlNotRunnable"
+  | "notLoggedIn"
+  | "networkTimeout"
+  | "permissionDenied"
+  | "invalidInput"
+  | "directoryNotWritable"
+  | "databaseBusy"
+  | "interrupted"
+  | "cancelled"
+  | "unknown";
+
+export interface ClassifiedError {
+  category: ErrorCategory;
+  title: string;
+  message: string;
+  redactedDetail?: string | null;
+}
+
+export type DiagnosticSeverity = "info" | "warning" | "blocker";
+export type DiagnosticStatus = "ok" | "warning" | "error" | "skipped";
+export type DiagnosticOverall = "ready" | "needsAttention" | "blocked";
+export type DiagnosticActionKind =
+  | "refreshTdlInfo"
+  | "updateTdl"
+  | "checkLogin"
+  | "chooseDirectory"
+  | "openDiagnostics"
+  | "collectLogs"
+  | "retryDownload"
+  | "continueDownload";
+
+export interface DiagnosticAction {
+  kind: DiagnosticActionKind;
+  label: string;
+  detail?: string | null;
+}
+
+export interface DiagnosticCheck {
+  id: string;
+  scope: string;
+  label: string;
+  severity: DiagnosticSeverity;
+  status: DiagnosticStatus;
+  summary: string;
+  detail?: string | null;
+  action?: DiagnosticAction | null;
+}
+
+export interface HistoryHealth {
+  status: DiagnosticStatus;
+  totalRecords: number;
+  staleDownloadingCount: number;
+  missingRequestCount: number;
+  warning?: string | null;
+}
+
+export interface DiagnosticsSnapshot {
+  generatedAt: string;
+  overall: DiagnosticOverall;
+  checks: DiagnosticCheck[];
+  historyHealth: HistoryHealth;
+}
+
 export interface DownloadRecord {
   id: string;
   taskId: string;
@@ -45,6 +110,8 @@ export interface DownloadRecord {
   createdAt: string;
   completedAt?: string | null;
   error?: string | null;
+  errorCategory?: ErrorCategory | null;
+  errorHint?: string | null;
   request?: DownloadRequest | ChatDownloadRequest;
 }
 
@@ -158,6 +225,8 @@ export interface DownloadEvent {
   recordIds: string[];
   completedAt?: string | null;
   error?: string | null;
+  errorCategory?: ErrorCategory | null;
+  errorHint?: string | null;
 }
 
 export type LoginMethod = "desktop" | "qr";

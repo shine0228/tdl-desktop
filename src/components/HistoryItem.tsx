@@ -51,6 +51,7 @@ export function HistoryItem({
           <span>{formatDate(record.completedAt ?? record.createdAt, language)}</span>
         </div>
         {record.error ? <p>{record.error}</p> : null}
+        {record.errorHint ? <p><strong>{t("errorHint")}:</strong> {record.errorHint}</p> : null}
         <div className="history-actions">
           {onRetry && record.request && (
             <button
@@ -85,7 +86,7 @@ export function HistoryItem({
               {t("openDirectory")}
             </button>
           )}
-          {onCopyError && record.error && (
+          {onCopyError && (record.error || record.errorHint) && (
             <button
               type="button"
               className="text-button"

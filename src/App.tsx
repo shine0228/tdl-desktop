@@ -53,6 +53,7 @@ import type {
   TdlUpdateEvent,
   LogPackageInfo,
   DesktopUpdateStatus,
+  DiagnosticsSnapshot,
 } from "./types";
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -212,6 +213,8 @@ function App() {
   const [desktopUpdateChecking, setDesktopUpdateChecking] = useState(false);
   const [logPackage, setLogPackage] = useState<LogPackageInfo | null>(null);
   const [desktopUpdateStatus, setDesktopUpdateStatus] = useState<DesktopUpdateStatus | null>(null);
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsSnapshot | null>(null);
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
   const [desktopVersion, setDesktopVersion] = useState("");
   const [fullMedia, setFullMedia] = useState<FullMedia | null>(null);
   const [lastCompletedTask, setLastCompletedTask] = useState<{
@@ -413,6 +416,19 @@ function App() {
     );
   }, [chatSearch, chats]);
 
+  async function loadDiagnostics() {
+    if (!inTauri()) return;
+    setDiagnosticsLoading(true);
+    try {
+      const snapshot = await invoke<DiagnosticsSnapshot>("get_diagnostics");
+      setDiagnostics(snapshot);
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setDiagnosticsLoading(false);
+    }
+  }
+
   async function loadState() {
     if (!inTauri()) {
       setMessage(t("frontendPreviewMode"));
@@ -429,6 +445,7 @@ function App() {
       setTdl(state.tdl);
       setDesktopVersion(state.desktopVersion);
       setMessage(state.tdl.available ? t("ready") : t("tdlUnavailable"));
+      void loadDiagnostics();
       if (state.tdl.available) {
         void refreshLoginStatus().then((status) => {
           if (status?.loggedIn) {
@@ -488,6 +505,8 @@ function App() {
                 status: event.status ?? record.status,
                 completedAt: event.completedAt,
                 error: event.error,
+                errorCategory: event.errorCategory,
+                errorHint: event.errorHint,
               }
             : record,
         );
@@ -993,10 +1012,13 @@ function App() {
   }
 
   async function copyRecordError(record: DownloadRecord) {
-    if (!record.error) return;
+    if (!record.error && !record.errorHint) return;
+    const text = [record.error, record.errorHint ? `${t("errorHint")}: ${record.errorHint}` : null]
+      .filter(Boolean)
+      .join("\n");
     try {
-      await navigator.clipboard.writeText(record.error);
-      setMessage(t("copyError") + ": " + record.error.slice(0, 50));
+      await navigator.clipboard.writeText(text);
+      setMessage(t("copyError") + ": " + text.slice(0, 50));
     } catch (error) {
       setMessage(String(error));
     }
@@ -1222,6 +1244,8 @@ function App() {
               tdl={tdl}
               t={t}
               logPackage={logPackage}
+              diagnostics={diagnostics}
+              diagnosticsLoading={diagnosticsLoading}
               desktopUpdateStatus={desktopUpdateStatus}
               desktopVersion={desktopVersion}
               desktopUpdateChecking={desktopUpdateChecking}
@@ -1230,6 +1254,7 @@ function App() {
               onSaveConfig={saveConfig}
               onPickLogDirectory={() => void pickLogDirectory()}
               onCollectLogs={() => void collectLogs()}
+              onRefreshDiagnostics={() => void loadDiagnostics()}
               onCheckDesktopUpdate={() => void checkDesktopUpdate()}
               onCheckTdlUpdate={() => void checkTdlUpdate()}
               onUpdateTdl={() => void updateTdl()}
