@@ -30,7 +30,7 @@ npm run fetch:tdl
 ## 常用命令
 
 ```bat
-npm install
+npm ci
 npm run build
 npm run tauri:build
 ```

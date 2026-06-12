@@ -24,7 +24,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-call npm install
+call npm ci
 if errorlevel 1 goto :error
 
 call npm run tauri:build
