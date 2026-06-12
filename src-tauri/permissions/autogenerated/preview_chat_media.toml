@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-preview-chat-media"
+description = "Enables the preview_chat_media command without any pre-configured scope."
+commands.allow = ["preview_chat_media"]
+
+[[permission]]
+identifier = "deny-preview-chat-media"
+description = "Denies the preview_chat_media command without any pre-configured scope."
+commands.deny = ["preview_chat_media"]

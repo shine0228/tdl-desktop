@@ -3,5 +3,32 @@
   "identifier": "default",
   "description": "Default desktop capability",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "allow-get-app-state",
+    "allow-save-config",
+    "allow-pick-directory",
+    "allow-pick-log-directory",
+    "allow-open-directory",
+    "allow-preview-download-command",
+    "allow-start-download",
+    "allow-cancel-download",
+    "allow-clear-history",
+    "allow-get-diagnostics",
+    "allow-collect-logs",
+    "allow-check-desktop-update",
+    "allow-refresh-tdl-info",
+    "allow-update-tdl",
+    "allow-clear-chat-cache",
+    "allow-list-chats",
+    "allow-export-chat-messages",
+    "allow-download-from-chat",
+    "allow-preview-chat-media",
+    "allow-cached-chat-media-preview",
+    "allow-check-login-status",
+    "allow-start-login",
+    "allow-cancel-login",
+    "allow-logout",
+    "allow-preview-link"
+  ]
 }

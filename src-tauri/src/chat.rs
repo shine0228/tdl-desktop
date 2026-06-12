@@ -17,8 +17,8 @@ use tauri::{path::BaseDirectory, AppHandle, Manager, State};
 use crate::{
     commands::OperationGuard,
     download::{
-        spawn_output_reader, spawn_process_monitor_with_cleanup, ChildProcessGuard,
-        PendingHistoryGuard,
+        shared_output_tail, spawn_output_reader, spawn_process_monitor, ChildProcessGuard,
+        PendingHistoryGuard, ProcessMonitorArgs,
     },
     state::AppState,
     tdl::resolve_tdl,
@@ -180,6 +180,8 @@ pub fn download_from_chat(
         created_at,
         completed_at: None,
         error: None,
+        error_category: None,
+        error_hint: None,
         request: request_json,
     }];
     let record_ids: Vec<String> = records.iter().map(|record| record.id.clone()).collect();
@@ -210,22 +212,36 @@ pub fn download_from_chat(
     lock(&state.running)?.insert(task_id.clone(), Arc::clone(&child));
     drop(operation_guard);
 
+    let output_tail = shared_output_tail();
+    let mut output_join_handles = Vec::new();
     if let Some(stream) = stdout {
-        spawn_output_reader(app.clone(), task_id.clone(), stream);
+        output_join_handles.push(spawn_output_reader(
+            app.clone(),
+            task_id.clone(),
+            stream,
+            Some(Arc::clone(&output_tail)),
+        ));
     }
     if let Some(stream) = stderr {
-        spawn_output_reader(app.clone(), task_id.clone(), stream);
+        output_join_handles.push(spawn_output_reader(
+            app.clone(),
+            task_id.clone(),
+            stream,
+            Some(Arc::clone(&output_tail)),
+        ));
     }
 
-    spawn_process_monitor_with_cleanup(
+    spawn_process_monitor(ProcessMonitorArgs {
         app,
-        state.refs(),
-        task_id.clone(),
+        state: state.refs(),
+        task_id: task_id.clone(),
         record_ids,
         child,
-        Some(export_path),
+        cleanup_file: Some(export_path),
+        output_tail,
+        output_join_handles,
         database_guard,
-    );
+    });
     child_guard.disarm();
     history_guard.disarm();
 

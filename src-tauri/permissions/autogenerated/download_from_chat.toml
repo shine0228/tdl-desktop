@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-download-from-chat"
+description = "Enables the download_from_chat command without any pre-configured scope."
+commands.allow = ["download_from_chat"]
+
+[[permission]]
+identifier = "deny-download-from-chat"
+description = "Denies the download_from_chat command without any pre-configured scope."
+commands.deny = ["download_from_chat"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cached-chat-media-preview"
+description = "Enables the cached_chat_media_preview command without any pre-configured scope."
+commands.allow = ["cached_chat_media_preview"]
+
+[[permission]]
+identifier = "deny-cached-chat-media-preview"
+description = "Denies the cached_chat_media_preview command without any pre-configured scope."
+commands.deny = ["cached_chat_media_preview"]

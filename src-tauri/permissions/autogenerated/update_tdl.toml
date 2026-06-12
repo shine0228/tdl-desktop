@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-update-tdl"
+description = "Enables the update_tdl command without any pre-configured scope."
+commands.allow = ["update_tdl"]
+
+[[permission]]
+identifier = "deny-update-tdl"
+description = "Denies the update_tdl command without any pre-configured scope."
+commands.deny = ["update_tdl"]

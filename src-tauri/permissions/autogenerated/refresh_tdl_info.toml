@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-refresh-tdl-info"
+description = "Enables the refresh_tdl_info command without any pre-configured scope."
+commands.allow = ["refresh_tdl_info"]
+
+[[permission]]
+identifier = "deny-refresh-tdl-info"
+description = "Denies the refresh_tdl_info command without any pre-configured scope."
+commands.deny = ["refresh_tdl_info"]

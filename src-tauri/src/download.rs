@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     io::{BufRead, BufReader, Read},
     path::PathBuf,
@@ -15,13 +15,39 @@ use tauri::{AppHandle, Emitter};
 use crate::{
     state::{AppState, StateRefs},
     types::{
-        DownloadEvent, DownloadEventKind, DownloadFileProgress, DownloadRecord, DownloadRequest,
-        DownloadStatus, SourceMode,
+        ClassifiedError, DownloadEvent, DownloadEventKind, DownloadFileProgress, DownloadRecord,
+        DownloadRequest, DownloadStatus, SourceMode,
     },
     util::{parse_progress, strip_ansi, write_json, TdlDatabaseGuard},
 };
 
 const OUTPUT_THROTTLE_INTERVAL: Duration = Duration::from_millis(180);
+const OUTPUT_TAIL_MAX_LINES: usize = 24;
+
+#[derive(Debug, Default)]
+pub struct OutputTail {
+    lines: VecDeque<String>,
+}
+
+impl OutputTail {
+    fn push(&mut self, line: &str) {
+        if self.lines.len() >= OUTPUT_TAIL_MAX_LINES {
+            self.lines.pop_front();
+        }
+        self.lines
+            .push_back(crate::redaction::redact_support_text(line));
+    }
+
+    fn joined(&self) -> Option<String> {
+        (!self.lines.is_empty()).then(|| self.lines.iter().cloned().collect::<Vec<_>>().join("\n"))
+    }
+}
+
+pub type SharedOutputTail = Arc<Mutex<OutputTail>>;
+
+pub fn shared_output_tail() -> SharedOutputTail {
+    Arc::new(Mutex::new(OutputTail::default()))
+}
 
 pub struct ChildProcessGuard {
     child: Arc<Mutex<Child>>,
@@ -136,6 +162,8 @@ pub fn build_records(
             created_at: created_at.to_string(),
             completed_at: None,
             error: None,
+            error_category: None,
+            error_hint: None,
             request: request_json.clone(),
         })
         .collect())
@@ -272,7 +300,12 @@ fn split_args(input: &str) -> Result<Vec<String>, String> {
 /// 把子进程输出按 `\n` 或 `\r` 切成行,实时往前端推。
 /// 单独处理是因为 tdl 的进度条只刷 `\r` 不换行,
 /// 标准的 `BufRead::lines()` 会把整段进度全卡在缓冲区里。
-pub fn spawn_output_reader<R>(app: AppHandle, task_id: String, stream: R)
+pub fn spawn_output_reader<R>(
+    app: AppHandle,
+    task_id: String,
+    stream: R,
+    output_tail: Option<SharedOutputTail>,
+) -> thread::JoinHandle<()>
 where
     R: Read + Send + 'static,
 {
@@ -292,6 +325,7 @@ where
                         format!("读取 tdl 输出失败: {error}"),
                         None,
                         None,
+                        output_tail.as_ref(),
                     );
                     break;
                 }
@@ -300,7 +334,13 @@ where
             let consumed = buf.len();
             for &byte in buf {
                 match byte {
-                    b'\n' | b'\r' => flush_line(&app, &task_id, &mut pending, &mut throttle),
+                    b'\n' | b'\r' => flush_line(
+                        &app,
+                        &task_id,
+                        &mut pending,
+                        &mut throttle,
+                        output_tail.as_ref(),
+                    ),
                     _ => pending.push(byte),
                 }
             }
@@ -309,9 +349,16 @@ where
 
         // 进程结束时把残留输出也吐出去,避免最后一行被吞。
         if !pending.is_empty() {
-            flush_line_inner(&app, &task_id, &mut pending, &mut throttle, true);
+            flush_line_inner(
+                &app,
+                &task_id,
+                &mut pending,
+                &mut throttle,
+                true,
+                output_tail.as_ref(),
+            );
         }
-    });
+    })
 }
 
 fn flush_line(
@@ -319,8 +366,9 @@ fn flush_line(
     task_id: &str,
     pending: &mut Vec<u8>,
     throttle: &mut OutputThrottle,
+    output_tail: Option<&SharedOutputTail>,
 ) {
-    flush_line_inner(app, task_id, pending, throttle, false);
+    flush_line_inner(app, task_id, pending, throttle, false, output_tail);
 }
 
 fn flush_line_inner(
@@ -329,6 +377,7 @@ fn flush_line_inner(
     pending: &mut Vec<u8>,
     throttle: &mut OutputThrottle,
     force: bool,
+    output_tail: Option<&SharedOutputTail>,
 ) {
     if pending.is_empty() {
         return;
@@ -344,7 +393,11 @@ fn flush_line_inner(
     let progress = parse_progress(&line);
     let file_progress = parse_file_progress(&line);
     if throttle.should_emit(progress, file_progress.as_ref(), force) {
-        emit_line(app, task_id, line, progress, file_progress);
+        emit_line(app, task_id, line, progress, file_progress, output_tail);
+    } else if let Some(output_tail) = output_tail {
+        if let Ok(mut output_tail) = output_tail.lock() {
+            output_tail.push(&line);
+        }
     }
 }
 
@@ -425,7 +478,14 @@ fn emit_line(
     line: String,
     progress: Option<f64>,
     file_progress: Option<DownloadFileProgress>,
+    output_tail: Option<&SharedOutputTail>,
 ) {
+    if let Some(output_tail) = output_tail {
+        if let Ok(mut output_tail) = output_tail.lock() {
+            output_tail.push(&line);
+        }
+    }
+
     let _ = app.emit(
         "download-event",
         DownloadEvent {
@@ -439,39 +499,37 @@ fn emit_line(
             record_ids: Vec::new(),
             completed_at: None,
             error: None,
+            error_category: None,
+            error_hint: None,
         },
     );
 }
 
-pub fn spawn_process_monitor(
-    app: AppHandle,
-    state: StateRefs,
-    task_id: String,
-    record_ids: Vec<String>,
-    child: Arc<Mutex<Child>>,
-    database_guard: TdlDatabaseGuard,
-) {
-    spawn_process_monitor_with_cleanup(
-        app,
-        state,
-        task_id,
-        record_ids,
-        child,
-        None,
-        database_guard,
-    );
+pub struct ProcessMonitorArgs {
+    pub app: AppHandle,
+    pub state: StateRefs,
+    pub task_id: String,
+    pub record_ids: Vec<String>,
+    pub child: Arc<Mutex<Child>>,
+    pub cleanup_file: Option<PathBuf>,
+    pub output_tail: SharedOutputTail,
+    pub output_join_handles: Vec<thread::JoinHandle<()>>,
+    pub database_guard: TdlDatabaseGuard,
 }
 
-pub fn spawn_process_monitor_with_cleanup(
-    app: AppHandle,
-    state: StateRefs,
-    task_id: String,
-    record_ids: Vec<String>,
-    child: Arc<Mutex<Child>>,
-    cleanup_file: Option<PathBuf>,
-    database_guard: TdlDatabaseGuard,
-) {
+pub fn spawn_process_monitor(args: ProcessMonitorArgs) {
     thread::spawn(move || {
+        let ProcessMonitorArgs {
+            app,
+            state,
+            task_id,
+            record_ids,
+            child,
+            cleanup_file,
+            output_tail,
+            output_join_handles,
+            database_guard,
+        } = args;
         let _database_guard = database_guard;
         let exit_code = loop {
             let status = {
@@ -492,6 +550,11 @@ pub fn spawn_process_monitor_with_cleanup(
             }
         };
 
+        let _ = output_join_handles
+            .into_iter()
+            .map(|handle| handle.join())
+            .collect::<Vec<_>>();
+
         let cancelled = match state.cancelled.lock() {
             Ok(mut cancelled) => cancelled.remove(&task_id),
             Err(_) => {
@@ -510,6 +573,7 @@ pub fn spawn_process_monitor_with_cleanup(
             let _ = fs::remove_file(path);
         }
 
+        let output_detail = output_tail.lock().ok().and_then(|tail| tail.joined());
         let (status, message, error) = if cancelled {
             (
                 DownloadStatus::Cancelled,
@@ -519,12 +583,19 @@ pub fn spawn_process_monitor_with_cleanup(
         } else if exit_code == Some(0) {
             (DownloadStatus::Completed, "下载完成".to_string(), None)
         } else {
-            let detail = exit_code
+            let exit_detail = exit_code
                 .map(|code| format!("下载失败 (退出码: {code})"))
                 .unwrap_or_else(|| "下载失败,未能获取退出码".to_string());
+            let detail = output_detail
+                .filter(|detail| !detail.trim().is_empty())
+                .map(|detail| format!("{exit_detail}\n{detail}"))
+                .unwrap_or(exit_detail);
             (DownloadStatus::Failed, detail.clone(), Some(detail))
         };
 
+        let classified_error = error.as_deref().map(ClassifiedError::from_message);
+        let error_category = classified_error.as_ref().map(|error| error.category);
+        let error_hint = classified_error.as_ref().map(|error| error.message.clone());
         let completed_at = Utc::now().to_rfc3339();
         match state.history.lock() {
             Ok(mut history) => {
@@ -533,6 +604,8 @@ pub fn spawn_process_monitor_with_cleanup(
                         record.status = status;
                         record.completed_at = Some(completed_at.clone());
                         record.error = error.clone();
+                        record.error_category = error_category;
+                        record.error_hint = error_hint.clone();
                     }
                 }
                 if let Err(error) = write_json(&state.history_path, &*history) {
@@ -555,6 +628,8 @@ pub fn spawn_process_monitor_with_cleanup(
                 record_ids,
                 completed_at: Some(completed_at),
                 error,
+                error_category,
+                error_hint,
             },
         );
     });

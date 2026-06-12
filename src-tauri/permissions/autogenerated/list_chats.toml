@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-chats"
+description = "Enables the list_chats command without any pre-configured scope."
+commands.allow = ["list_chats"]
+
+[[permission]]
+identifier = "deny-list-chats"
+description = "Denies the list_chats command without any pre-configured scope."
+commands.deny = ["list_chats"]

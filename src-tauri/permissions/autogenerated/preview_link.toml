@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-preview-link"
+description = "Enables the preview_link command without any pre-configured scope."
+commands.allow = ["preview_link"]
+
+[[permission]]
+identifier = "deny-preview-link"
+description = "Denies the preview_link command without any pre-configured scope."
+commands.deny = ["preview_link"]

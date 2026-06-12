@@ -9,16 +9,18 @@ use chrono::Utc;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
+    diagnostics::diagnostics_snapshot,
     download::{
-        build_download_args, build_records, spawn_output_reader, spawn_process_monitor,
-        ChildProcessGuard, PendingHistoryGuard,
+        build_download_args, build_records, shared_output_tail, spawn_output_reader,
+        spawn_process_monitor, ChildProcessGuard, PendingHistoryGuard, ProcessMonitorArgs,
     },
+    redaction::redact_support_text,
     state::AppState,
     tdl::{resolve_tdl, update_tdl as update_tdl_impl},
     tdl_config::{add_missing_raw_global_args, prepend_tdl_global_args},
     types::{
-        AppConfig, AppSnapshot, DesktopUpdateStatus, DownloadRequest, DownloadStarted,
-        LogPackageInfo, SourceMode, TdlInfo, TdlUpdateEvent, TdlUpdateStatus,
+        AppConfig, AppSnapshot, DesktopUpdateStatus, DiagnosticsSnapshot, DownloadRequest,
+        DownloadStarted, LogPackageInfo, SourceMode, TdlInfo, TdlUpdateEvent, TdlUpdateStatus,
     },
     util::{
         apply_hidden_process_flags, lock, preview_command, tdl_database_guard,
@@ -196,21 +198,36 @@ pub fn start_download(
     lock(&state.running)?.insert(task_id.clone(), Arc::clone(&child));
     drop(operation_guard);
 
+    let output_tail = shared_output_tail();
+    let mut output_join_handles = Vec::new();
     if let Some(stream) = stdout {
-        spawn_output_reader(app.clone(), task_id.clone(), stream);
+        output_join_handles.push(spawn_output_reader(
+            app.clone(),
+            task_id.clone(),
+            stream,
+            Some(Arc::clone(&output_tail)),
+        ));
     }
     if let Some(stream) = stderr {
-        spawn_output_reader(app.clone(), task_id.clone(), stream);
+        output_join_handles.push(spawn_output_reader(
+            app.clone(),
+            task_id.clone(),
+            stream,
+            Some(Arc::clone(&output_tail)),
+        ));
     }
 
-    spawn_process_monitor(
+    spawn_process_monitor(ProcessMonitorArgs {
         app,
-        state.refs(),
-        task_id.clone(),
+        state: state.refs(),
+        task_id: task_id.clone(),
         record_ids,
         child,
+        cleanup_file: None,
+        output_tail,
+        output_join_handles,
         database_guard,
-    );
+    });
     child_guard.disarm();
     history_guard.disarm();
 
@@ -245,6 +262,14 @@ pub fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
     let mut history = lock(&state.history)?;
     history.clear();
     state.persist_history(&history)
+}
+
+#[tauri::command]
+pub fn get_diagnostics(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DiagnosticsSnapshot, String> {
+    diagnostics_snapshot(&app, &state)
 }
 
 #[tauri::command]
@@ -409,7 +434,7 @@ fn build_sanitized_log_report(state: &AppState, config: &AppConfig) -> Result<St
         "TDL Desktop Diagnostic Log".to_string(),
         format!("generated_at={}", Utc::now().to_rfc3339()),
         format!("app_version={}", env!("CARGO_PKG_VERSION")),
-        format!("language={}", sanitize_log_text(&config.language)),
+        format!("language={}", redact_support_text(&config.language)),
         format!("download_limit={}", config.limit),
         format!("download_threads={}", config.threads),
         format!("download_pool={}", config.pool),
@@ -423,167 +448,11 @@ fn build_sanitized_log_report(state: &AppState, config: &AppConfig) -> Result<St
             "- status={:?} mode={:?} source={} directory={} error={}",
             record.status,
             record.mode,
-            sanitize_log_text(&record.source),
-            sanitize_log_text(&record.directory),
-            sanitize_log_text(record.error.as_deref().unwrap_or("")),
+            redact_support_text(&record.source),
+            redact_support_text(&record.directory),
+            redact_support_text(record.error.as_deref().unwrap_or("")),
         ));
     }
 
     Ok(lines.join("\n"))
-}
-
-fn sanitize_log_text(value: &str) -> String {
-    let mut output = value.to_string();
-    if let Some(home) = dirs::home_dir().map(|path| path.to_string_lossy().to_string()) {
-        if !home.is_empty() {
-            output = output.replace(&home, "<USER_HOME>");
-        }
-    }
-    output = redact_tg_links(&output);
-    output = redact_bot_tokens(&output);
-    output = redact_key_values(
-        &output,
-        &[
-            "token",
-            "api_hash",
-            "authorization",
-            "password",
-            "passcode",
-            "access_token",
-        ],
-    );
-    output = redact_telegram_usernames(&output);
-    redact_long_numbers(&output)
-}
-
-fn redact_tg_links(value: &str) -> String {
-    value
-        .split_whitespace()
-        .map(|part| {
-            let lower = part.to_ascii_lowercase();
-            if lower.contains("t.me/") || lower.contains("telegram.me/") || lower.contains("tg://")
-            {
-                "<TG_LINK>".to_string()
-            } else {
-                part.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn redact_bot_tokens(value: &str) -> String {
-    value
-        .split_whitespace()
-        .map(|part| {
-            let mut pieces = part.splitn(2, ':');
-            let id = pieces.next().unwrap_or_default();
-            let token = pieces.next().unwrap_or_default();
-            if id.starts_with("bot")
-                && id[3..].chars().all(|ch| ch.is_ascii_digit())
-                && token.len() >= 20
-            {
-                "<BOT_TOKEN>".to_string()
-            } else {
-                part.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn redact_key_values(value: &str, keys: &[&str]) -> String {
-    value
-        .split_whitespace()
-        .map(|part| redact_key_value_part(part, keys))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn redact_key_value_part(part: &str, keys: &[&str]) -> String {
-    let mut output = part.to_string();
-    for key in keys {
-        output = redact_key_value_with_separator(&output, key, '=');
-        output = redact_key_value_with_separator(&output, key, ':');
-    }
-    output
-}
-
-fn redact_key_value_with_separator(part: &str, key: &str, separator: char) -> String {
-    let lower = part.to_ascii_lowercase();
-    let key_lower = key.to_ascii_lowercase();
-    let Some(index) = find_key_separator(&lower, &key_lower, separator) else {
-        return part.to_string();
-    };
-    let value_start = index + key.len() + separator.len_utf8();
-    let value_end = part[value_start..]
-        .find(['&', ',', ';'])
-        .map(|offset| value_start + offset)
-        .unwrap_or(part.len());
-    if value_start == value_end {
-        return part.to_string();
-    }
-    format!("{}<SECRET>{}", &part[..value_start], &part[value_end..])
-}
-
-fn find_key_separator(value: &str, key: &str, separator: char) -> Option<usize> {
-    let needle = format!("{key}{separator}");
-    value.match_indices(&needle).find_map(|(index, _)| {
-        if index == 0 || matches!(value.as_bytes()[index - 1], b'?' | b'&' | b',' | b';') {
-            Some(index)
-        } else {
-            None
-        }
-    })
-}
-
-fn redact_telegram_usernames(value: &str) -> String {
-    value
-        .split_whitespace()
-        .map(|part| {
-            if part.starts_with('@') && part.len() > 1 {
-                "<TG_USERNAME>".to_string()
-            } else {
-                part.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn redact_long_numbers(value: &str) -> String {
-    value
-        .split_whitespace()
-        .map(|part| {
-            let digits = part.chars().filter(|ch| ch.is_ascii_digit()).count();
-            if digits >= 8 {
-                "<PHONE_OR_ID>".to_string()
-            } else {
-                part.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sanitize_log_text;
-
-    #[test]
-    fn redacts_query_secrets_and_telegram_links() {
-        let output = sanitize_log_text("url=https://example.test/cb?token=abc123&ok=1 tg://resolve?domain=user https://t.me/name");
-        assert!(output.contains("token=<SECRET>&ok=1"));
-        assert!(!output.contains("abc123"));
-        assert!(!output.contains("tg://"));
-        assert!(!output.contains("t.me/name"));
-    }
-
-    #[test]
-    fn redacts_bot_tokens_and_usernames() {
-        let output = sanitize_log_text("bot123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ @someone");
-        assert!(output.contains("<BOT_TOKEN>"));
-        assert!(output.contains("<TG_USERNAME>"));
-        assert!(!output.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
-    }
 }

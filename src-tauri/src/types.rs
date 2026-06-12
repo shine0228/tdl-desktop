@@ -131,7 +131,294 @@ pub struct DownloadRecord {
     pub completed_at: Option<String>,
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_category: Option<ErrorCategory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ErrorCategory {
+    MissingTdl,
+    TdlNotRunnable,
+    NotLoggedIn,
+    NetworkTimeout,
+    PermissionDenied,
+    InvalidInput,
+    DirectoryNotWritable,
+    DatabaseBusy,
+    Interrupted,
+    Cancelled,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifiedError {
+    pub category: ErrorCategory,
+    pub title: String,
+    pub message: String,
+    pub redacted_detail: Option<String>,
+}
+
+impl ClassifiedError {
+    pub fn from_message(message: &str) -> Self {
+        let lower = message.to_ascii_lowercase();
+        let (category, title, hint) = if contains_any(
+            &lower,
+            &[
+                "用户取消",
+                "cancelled",
+                "canceled",
+                "operation cancelled",
+                "context canceled",
+            ],
+        ) {
+            (
+                ErrorCategory::Cancelled,
+                "任务已取消",
+                "任务已被用户取消。如需继续，请从历史记录重新开始或继续下载。",
+            )
+        } else if contains_any(
+            &lower,
+            &[
+                "未找到可用的 tdl",
+                "tdl 路径不可用",
+                "tdl not found",
+                "tdl executable not found",
+                "missing tdl",
+                "cannot find tdl",
+            ],
+        ) || ((lower.contains("tdl.exe") || lower.contains("tdl "))
+            && contains_any(
+                &lower,
+                &["no such file", "not found", "系统找不到指定的文件"],
+            ))
+        {
+            (
+                ErrorCategory::MissingTdl,
+                "tdl 不可用",
+                "请刷新 tdl 信息，或在设置中重新下载/更新 tdl。",
+            )
+        } else if contains_any(
+            &lower,
+            &[
+                "not executable",
+                "无法启动 tdl",
+                "启动 tdl",
+                "spawn",
+                "不是有效的 win32",
+                "exec format",
+            ],
+        ) {
+            (
+                ErrorCategory::TdlNotRunnable,
+                "tdl 无法运行",
+                "请确认 tdl 文件完整且可执行，必要时重新更新 tdl。",
+            )
+        } else if contains_any(
+            &lower,
+            &[
+                "not logged in",
+                "login required",
+                "unauthorized",
+                "forbidden",
+                "401",
+                "403",
+                "auth",
+                "登录",
+                "未登录",
+            ],
+        ) {
+            (
+                ErrorCategory::NotLoggedIn,
+                "登录状态不可用",
+                "请在登录区域重新检查 Telegram 登录状态后再试。",
+            )
+        } else if contains_any(
+            &lower,
+            &[
+                "database is locked",
+                "database locked",
+                "database busy",
+                "resource busy",
+                "另一个 tdl",
+                "数据库",
+                "被占用",
+            ],
+        ) {
+            (
+                ErrorCategory::DatabaseBusy,
+                "tdl 数据库忙碌",
+                "请等待当前 tdl 操作结束，或稍后重试。",
+            )
+        } else if contains_any(
+            &lower,
+            &[
+                "timeout",
+                "timed out",
+                "deadline exceeded",
+                "connection reset",
+                "connection refused",
+                "network",
+                "dns",
+                "proxy",
+                "tls",
+                "超时",
+                "网络",
+                "连接",
+            ],
+        ) {
+            (
+                ErrorCategory::NetworkTimeout,
+                "网络或超时问题",
+                "请检查网络、代理和 Telegram 连接状态后重试。",
+            )
+        } else if contains_any(
+            &lower,
+            &["permission denied", "access denied", "拒绝访问", "权限"],
+        ) {
+            (
+                ErrorCategory::PermissionDenied,
+                "权限不足",
+                "请确认应用对下载目录和 tdl 文件有读取/写入权限。",
+            )
+        } else if contains_any(
+            &lower,
+            &[
+                "无法创建下载目录",
+                "directory",
+                "path",
+                "disk",
+                "no space",
+                "not writable",
+                "目录",
+                "路径",
+                "磁盘",
+            ],
+        ) {
+            (
+                ErrorCategory::DirectoryNotWritable,
+                "下载目录不可写",
+                "请选择一个可写的本地普通目录后重试。",
+            )
+        } else if contains_any(
+            &lower,
+            &["invalid", "请输入", "请选择", "参数", "格式", "parse"],
+        ) {
+            (
+                ErrorCategory::InvalidInput,
+                "输入参数需要检查",
+                "请检查下载链接、JSON 文件或原始参数后重试。",
+            )
+        } else if contains_any(&lower, &["interrupted", "broken pipe", "中断"]) {
+            (
+                ErrorCategory::Interrupted,
+                "任务被中断",
+                "请确认 tdl 进程和系统资源状态后重试。",
+            )
+        } else {
+            (
+                ErrorCategory::Unknown,
+                "未知错误",
+                "请查看错误详情；如需反馈，请生成并检查脱敏日志包。",
+            )
+        };
+
+        let redacted_detail =
+            (!message.trim().is_empty()).then(|| crate::redaction::redact_support_text(message));
+
+        Self {
+            category,
+            title: title.into(),
+            message: hint.into(),
+            redacted_detail,
+        }
+    }
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiagnosticSeverity {
+    Info,
+    Warning,
+    Blocker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiagnosticStatus {
+    Ok,
+    Warning,
+    Error,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiagnosticActionKind {
+    RefreshTdlInfo,
+    UpdateTdl,
+    CheckLogin,
+    ChooseDirectory,
+    OpenDiagnostics,
+    CollectLogs,
+    RetryDownload,
+    ContinueDownload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticAction {
+    pub kind: DiagnosticActionKind,
+    pub label: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticCheck {
+    pub id: String,
+    pub scope: String,
+    pub label: String,
+    pub severity: DiagnosticSeverity,
+    pub status: DiagnosticStatus,
+    pub summary: String,
+    pub detail: Option<String>,
+    pub action: Option<DiagnosticAction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiagnosticOverall {
+    Ready,
+    NeedsAttention,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryHealth {
+    pub status: DiagnosticStatus,
+    pub total_records: usize,
+    pub stale_downloading_count: usize,
+    pub missing_request_count: usize,
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsSnapshot {
+    pub generated_at: String,
+    pub overall: DiagnosticOverall,
+    pub checks: Vec<DiagnosticCheck>,
+    pub history_health: HistoryHealth,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +451,10 @@ pub struct DownloadEvent {
     pub record_ids: Vec<String>,
     pub completed_at: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_category: Option<ErrorCategory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,4 +640,59 @@ pub struct GitHubAsset {
     pub name: String,
     pub browser_download_url: String,
     pub digest: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClassifiedError, ErrorCategory};
+
+    #[test]
+    fn classifies_network_errors() {
+        let error = ClassifiedError::from_message("request timeout while connecting to Telegram");
+        assert_eq!(error.category, ErrorCategory::NetworkTimeout);
+        assert!(!error.message.is_empty());
+    }
+
+    #[test]
+    fn classifies_auth_errors() {
+        let error = ClassifiedError::from_message("401 unauthorized: login required");
+        assert_eq!(error.category, ErrorCategory::NotLoggedIn);
+        assert!(!error.message.is_empty());
+    }
+
+    #[test]
+    fn classifies_directory_errors() {
+        let error = ClassifiedError::from_message("无法创建下载目录: disk is read-only");
+        assert_eq!(error.category, ErrorCategory::DirectoryNotWritable);
+        assert!(!error.message.is_empty());
+    }
+
+    #[test]
+    fn classifies_unknown_errors() {
+        let error = ClassifiedError::from_message("unexpected tdl output");
+        assert_eq!(error.category, ErrorCategory::Unknown);
+        assert!(!error.message.is_empty());
+    }
+
+    #[test]
+    fn generic_missing_file_is_not_missing_tdl() {
+        let error =
+            ClassifiedError::from_message("open C:\\tmp\\input.json: no such file or directory");
+        assert_eq!(error.category, ErrorCategory::DirectoryNotWritable);
+    }
+
+    #[test]
+    fn missing_tdl_binary_is_missing_tdl() {
+        let error = ClassifiedError::from_message("tdl.exe: no such file or directory");
+        assert_eq!(error.category, ErrorCategory::MissingTdl);
+    }
+
+    #[test]
+    fn redacts_classified_error_detail() {
+        let error = ClassifiedError::from_message("password=super-secret-value");
+        assert_eq!(error.category, ErrorCategory::Unknown);
+        let detail = error.redacted_detail.expect("detail should be present");
+        assert!(detail.contains("password=<SECRET>"));
+        assert!(!detail.contains("super-secret-value"));
+    }
 }

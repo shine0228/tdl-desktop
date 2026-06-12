@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cancel-login"
+description = "Enables the cancel_login command without any pre-configured scope."
+commands.allow = ["cancel_login"]
+
+[[permission]]
+identifier = "deny-cancel-login"
+description = "Denies the cancel_login command without any pre-configured scope."
+commands.deny = ["cancel_login"]

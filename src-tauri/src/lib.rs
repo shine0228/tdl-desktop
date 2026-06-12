@@ -1,8 +1,10 @@
 mod chat;
 mod commands;
+mod diagnostics;
 mod download;
 mod login;
 mod preview;
+mod redaction;
 mod state;
 mod tdl;
 mod tdl_config;
@@ -29,6 +31,7 @@ pub fn run() {
             commands::start_download,
             commands::cancel_download,
             commands::clear_history,
+            commands::get_diagnostics,
             commands::collect_logs,
             commands::check_desktop_update,
             commands::refresh_tdl_info,
